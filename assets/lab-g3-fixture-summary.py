@@ -31,7 +31,7 @@ CONFIG_KEYS = {
     "valid_until_epoch",
 }
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-GENERATION = re.compile(r"^gen-[A-Za-z0-9TZ-]+$")
+GENERATION = re.compile(r"^gen-\d{8}T\d{6}Z-[0-9a-f]{12}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -353,6 +353,7 @@ def _archive_summary(fixture_fd, policy):
         if not ARCHIVE_REQUIRED_WINDOW.issubset(window_names):
             _fail("ARCHIVE_REQUIRED_EVIDENCE_MISSING")
         pair_maps = []
+        historical_generations = []
         for label in ("state-v3-attempt8", "state-v3-attempt8-live"):
             mpath = label + "/manifest.json"
             wpath = label + "/wal/wal-0000000000000001.log"
@@ -375,20 +376,33 @@ def _archive_summary(fixture_fd, policy):
                 _fail("ARCHIVE_V3_STATE_INVALID")
             actual_direct = {p[len(label) + 1:].split("/", 1)[0] for p in entries
                              if p.startswith(label + "/")}
-            if actual_direct != expected_direct:
-                _fail("ARCHIVE_V3_FILE_SET")
+            if not expected_direct.issubset(actual_direct):
+                _fail("ARCHIVE_V3_STATE_INVALID")
+            for name in ("wal", gen, prev):
+                if entries.get(label + "/" + name) != "dir":
+                    _fail("ARCHIVE_V3_STATE_INVALID")
+            extras = actual_direct - expected_direct
+            for name in extras:
+                rel = label + "/" + name
+                if not GENERATION.fullmatch(name):
+                    _fail("ARCHIVE_V3_STATE_ENTRY_SET")
+                if entries.get(rel) != "dir":
+                    _fail("ARCHIVE_V3_HISTORICAL_GENERATION_INVALID")
+                historical_generations.append(rel)
             _wal_dir_entries = {p for p in entries if p.startswith(label + "/wal/")}
             if _wal_dir_entries != {wpath}:
-                _fail("ARCHIVE_V3_FILE_SET")
-            submap = {p[len(label) + 1:]: rec["sha256"] for p, rec in files.items() if p.startswith(label + "/")}
-            pair_maps.append(submap)
+                _fail("ARCHIVE_V3_WAL_FILE_SET")
+            subfiles = {p[len(label) + 1:]: rec["sha256"] for p, rec in files.items() if p.startswith(label + "/")}
+            subdirs = {p[len(label) + 1:] for p in dirs if p.startswith(label + "/")}
+            pair_maps.append((subfiles, subdirs))
         if pair_maps[0] != pair_maps[1]:
             _fail("ARCHIVE_V3_COPIES_DIFFER")
         if _meta(archive_before) != _meta(os.fstat(archive_fd)):
             _fail("ARCHIVE_DRIFT")
         _verify_named_dir(fixture_fd, ARCHIVE, archive_fd, base_mnt)
         aggregate = _archive_digest(files, dirs)
-        return {"files": files, "dirs": dirs, "aggregate_sha256": aggregate,
+        return {"files": files, "dirs": dirs, "historical_generations": sorted(historical_generations),
+                "aggregate_sha256": aggregate,
                 "file_count": len(files), "entry_count": len(entries),
                 "root_meta": _meta(archive_before)}
     finally:
@@ -544,6 +558,8 @@ def _print_summary(config_sha, result, started_utc, ended_utc):
     am = arc["root_meta"]
     print("ARCHIVE type=directory path=" + ARCHIVE + " sha256=- uid=%d gid=%d mode=%04o top_level_exact=PASS files=%d entries=%d aggregate_sha256=%s" % (
         am[4], am[5], stat.S_IMODE(am[2]), arc["file_count"], arc["entry_count"], arc["aggregate_sha256"]))
+    for rel in arc["historical_generations"]:
+        print("ARCHIVE_V3_HISTORICAL_GENERATION type=directory path=%s" % rel)
     for rel in sorted(arc["files"], key=lambda s: s.encode("ascii")):
         rec = arc["files"][rel]
         print("ARCHIVE_FILE type=file path=%s sha256=%s size=%d uid=%d gid=%d mode=%04o" % (

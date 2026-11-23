@@ -178,6 +178,53 @@ class FixtureSummaryTests(unittest.TestCase):
         p.symlink_to(self.root / "deny.json")
         self.expect_category("SYMLINK_REFUSED")
 
+    def test_archive_accepts_and_records_matching_historical_generations(self):
+        name = "gen-19991231T230000Z-012345abcdef"
+        labels = ("state-v3-attempt8", "state-v3-attempt8-live")
+        for label in labels:
+            write(self.root / MOD.ARCHIVE / label / name / "consumed.jsonl", b"synthetic history\n")
+        result = MOD.summarize_for_test(str(self.root), self.policy)
+        self.assertEqual(result["archive"]["historical_generations"],
+                         sorted(f"{label}/{name}" for label in labels))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            MOD._print_summary("0" * 64, result, "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z")
+        self.assertEqual(out.getvalue().count("ARCHIVE_V3_HISTORICAL_GENERATION type=directory"), 2)
+
+    def test_reject_non_directory_historical_generation(self):
+        name = "gen-19991231T230000Z-012345abcdef"
+        (self.root / MOD.ARCHIVE / "state-v3-attempt8" / name).write_bytes(b"not a directory\n")
+        self.expect_category("ARCHIVE_V3_HISTORICAL_GENERATION_INVALID")
+
+    def test_reject_unexpected_v3_state_entry(self):
+        (self.root / MOD.ARCHIVE / "state-v3-attempt8" / "unexpected.txt").write_bytes(b"synthetic\n")
+        self.expect_category("ARCHIVE_V3_STATE_ENTRY_SET")
+
+    def test_reject_additional_v3_wal_file_with_specific_category(self):
+        (self.root / MOD.ARCHIVE / "state-v3-attempt8" / "wal" / "wal-0000000000000002.log").write_bytes(b"synthetic\n")
+        self.expect_category("ARCHIVE_V3_WAL_FILE_SET")
+
+    def test_v3_copies_must_match_historical_generation_set_and_contents(self):
+        name = "gen-19991231T230000Z-012345abcdef"
+        left = self.root / MOD.ARCHIVE / "state-v3-attempt8" / name / "consumed.jsonl"
+        right = self.root / MOD.ARCHIVE / "state-v3-attempt8-live" / name / "consumed.jsonl"
+        write(left, b"left synthetic history\n")
+        write(right, b"right synthetic history\n")
+        self.expect_category("ARCHIVE_V3_COPIES_DIFFER")
+
+    def test_v3_copies_must_match_empty_historical_directories(self):
+        name = "gen-19991231T230000Z-012345abcdef"
+        (self.root / MOD.ARCHIVE / "state-v3-attempt8" / name).mkdir()
+        (self.root / MOD.ARCHIVE / "state-v3-attempt8-live" / name).mkdir()
+        result = MOD.summarize_for_test(str(self.root), self.policy)
+        self.assertEqual(result["archive"]["historical_generations"],
+                         sorted((f"state-v3-attempt8/{name}", f"state-v3-attempt8-live/{name}")))
+
+    def test_v3_copies_must_match_historical_directory_sets(self):
+        name = "gen-19991231T230000Z-012345abcdef"
+        (self.root / MOD.ARCHIVE / "state-v3-attempt8" / name).mkdir()
+        self.expect_category("ARCHIVE_V3_COPIES_DIFFER")
+
     def test_reject_snapshot_drift_between_passes(self):
         def change():
             (self.root / "env" / "d6.env").write_bytes(b"different synthetic input\n")
