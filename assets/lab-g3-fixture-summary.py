@@ -62,8 +62,7 @@ def _mount_id(fd):
 
 
 def _dir_flags():
-    return (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) |
-            (getattr(os, "O_NOATIME", 0) if sys.platform.startswith("linux") else 0))
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
 def _file_flags():
@@ -102,7 +101,7 @@ def _open_dir(parent_fd, name, base_mnt=None):
         _fail("PATH_POLICY")
     _safe_stat_at(parent_fd, name)
     try:
-        fd = os.open(name, _dir_flags(), dir_fd=parent_fd)
+        fd = os.open(name, _dir_flags() | getattr(os, "O_NOATIME", 0), dir_fd=parent_fd)
     except OSError:
         _fail("PATH_REFUSED")
     st = os.fstat(fd)
