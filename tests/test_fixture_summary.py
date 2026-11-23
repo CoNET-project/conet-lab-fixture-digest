@@ -111,7 +111,8 @@ def make_fixture(base):
 
 class FixtureSummaryTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="lab-g3-summary-synth-", dir="/private/tmp")
+        parent = pathlib.Path(tempfile.gettempdir()).resolve()
+        self.tmp = tempfile.TemporaryDirectory(prefix="lab-g3-summary-synth-", dir=parent)
         self.root, self.policy = make_fixture(self.tmp.name)
 
     def tearDown(self):
