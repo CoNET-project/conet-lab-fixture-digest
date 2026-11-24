@@ -8,6 +8,7 @@ per-window values are supplied only by a root-owned bootstrap file.
 import datetime
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import pwd
@@ -48,6 +49,8 @@ RUN_BASE = "/run"
 MAX_WINDOW_SECONDS = 900
 MIN_WINDOW_SECONDS = 60
 MAX_HELPER_OUTPUT = 8 * 1024 * 1024
+IPROUTE2 = "/usr/sbin/ip"
+MAX_NETWORK_OUTPUT = 1024 * 1024
 SCRIPT = os.path.realpath(__file__)
 
 
@@ -717,6 +720,121 @@ def _mount_type(target):
     return None
 
 
+def _ip_json(args):
+    """Read network state from the current process network namespace."""
+    try:
+        result = subprocess.run([IPROUTE2, "-j", *args], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                env={"PATH": "/usr/sbin:/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+                                timeout=4, check=False)
+    except Exception:
+        fail("NETWORK_STATE_UNAVAILABLE")
+    if result.returncode != 0 or len(result.stdout) > MAX_NETWORK_OUTPUT:
+        fail("NETWORK_STATE_UNAVAILABLE")
+    try:
+        value = json.loads(result.stdout.decode("utf-8", "strict"))
+    except Exception:
+        fail("NETWORK_STATE_UNAVAILABLE")
+    if not isinstance(value, list):
+        fail("NETWORK_STATE_UNAVAILABLE")
+    return value
+
+
+def _network_address_rows(rows, family):
+    if not isinstance(rows, list):
+        fail("NETWORK_STATE_UNAVAILABLE")
+    # iproute2 filters out links without an address in the requested family;
+    # a successful JSON [] is valid absence, unlike missing or malformed data.
+    if not rows:
+        return
+    if len(rows) != 1:
+        fail("NETWORK_STATE_UNAVAILABLE")
+    for interface in rows:
+        if not isinstance(interface, dict) or interface.get("ifname") != "lo":
+            fail("NETWORK_NAMESPACE_NOT_ISOLATED")
+        addresses = interface.get("addr_info")
+        if not isinstance(addresses, list):
+            fail("NETWORK_STATE_UNAVAILABLE")
+        for item in addresses:
+            if not isinstance(item, dict) or item.get("family") != family:
+                fail("NETWORK_STATE_UNAVAILABLE")
+            local = item.get("local")
+            if not isinstance(local, str):
+                fail("NETWORK_STATE_UNAVAILABLE")
+            try:
+                address = ipaddress.ip_address(local.split("%", 1)[0])
+            except ValueError:
+                fail("NETWORK_STATE_UNAVAILABLE")
+            if address.version != (4 if family == "inet" else 6):
+                fail("NETWORK_STATE_UNAVAILABLE")
+            if not address.is_loopback:
+                fail("NETWORK_NAMESPACE_NOT_ISOLATED")
+
+
+def _network_routes(rows, family):
+    if not isinstance(rows, list):
+        fail("NETWORK_STATE_UNAVAILABLE")
+    loopback = ipaddress.ip_network("127.0.0.0/8" if family == 4 else "::1/128")
+    nonforwarding = {"unreachable", "blackhole", "prohibit"}
+    sentinel_count = 0
+    for route in rows:
+        if not isinstance(route, dict):
+            fail("NETWORK_STATE_UNAVAILABLE")
+        route_type = route.get("type", "unicast")
+        if not isinstance(route_type, str):
+            fail("NETWORK_STATE_UNAVAILABLE")
+        dst = route.get("dst")
+        if not isinstance(dst, str):
+            fail("NETWORK_STATE_UNAVAILABLE")
+        if dst == "default":
+            network = ipaddress.ip_network("0.0.0.0/0" if family == 4 else "::/0")
+        else:
+            try:
+                network = ipaddress.ip_network(dst, strict=False)
+            except ValueError:
+                fail("NETWORK_STATE_UNAVAILABLE")
+        if network.version != family:
+            fail("NETWORK_STATE_UNAVAILABLE")
+        dev = route.get("dev")
+        gateway = route.get("gateway")
+        if route_type in nonforwarding:
+            # An explicit non-forwarding route is not missing data. It is safe
+            # only when no device or gateway can turn it into an egress path.
+            if dev not in (None, "lo") or gateway is not None:
+                fail("NETWORK_NAMESPACE_NOT_ISOLATED")
+            sentinel_count += 1
+            continue
+        if route_type not in ("local", "broadcast", "multicast", "unicast"):
+            fail("NETWORK_STATE_UNAVAILABLE")
+        if dev != "lo" or gateway is not None:
+            fail("NETWORK_ROUTE_PRESENT")
+        if dst == "default":
+            fail("NETWORK_ROUTE_PRESENT")
+        if not network.subnet_of(loopback):
+            fail("NETWORK_ROUTE_PRESENT")
+    return "explicit_nonforwarding" if sentinel_count else "no_route_rows"
+
+
+def _check_network_isolation():
+    """Fail closed unless the current netns has loopback only and no egress route."""
+    links = _ip_json(["link", "show"])
+    if len(links) != 1 or not isinstance(links[0], dict):
+        fail("NETWORK_NAMESPACE_NOT_ISOLATED")
+    flags = links[0].get("flags")
+    if not isinstance(flags, list) or any(not isinstance(flag, str) for flag in flags):
+        fail("NETWORK_STATE_UNAVAILABLE")
+    if links[0].get("ifname") != "lo" or "LOOPBACK" not in flags:
+        fail("NETWORK_NAMESPACE_NOT_ISOLATED")
+    v4_addrs = _ip_json(["-4", "address", "show"])
+    v6_addrs = _ip_json(["-6", "address", "show"])
+    _network_address_rows(v4_addrs, "inet")
+    _network_address_rows(v6_addrs, "inet6")
+    v4_routes = _ip_json(["-4", "route", "show", "table", "all"])
+    v6_routes = _ip_json(["-6", "route", "show", "table", "all"])
+    _network_routes(v4_routes, 4)
+    _network_routes(v6_routes, 6)
+
+
 def _check_staged_file(path, expected_sha):
     try:
         st = os.lstat(path)
@@ -801,8 +919,7 @@ def _inner(role):
         fail("MOUNT_NAMESPACE_NOT_PRIVATE")
     if os.readlink("/proc/self/ns/net") == meta["host_net_ns"]:
         fail("NETWORK_NAMESPACE_NOT_PRIVATE")
-    if os.listdir("/sys/class/net") != ["lo"]:
-        fail("NETWORK_NAMESPACE_NOT_ISOLATED")
+    _check_network_isolation()
     os.makedirs(os.path.join(run_dir, "ns"), mode=0o700, exist_ok=True)
     _mount(["--make-rprivate", "/"])
     _mount(["-t", "tmpfs", "-o", "size=64m,mode=0700,nosuid,nodev", "tmpfs", os.path.join(run_dir, "ns")])
@@ -845,12 +962,6 @@ def _inner(role):
     _check_staged_file(os.path.join(run_dir, "payload", "archive.py"), meta["archive_sha256"])
     if _file_sha256("/etc/lab-fixture-digest/g3.json") != meta["config_sha256"]:
         fail("CONFIG_BINDING_MISMATCH")
-    # No external network interfaces/routes are required by either helper.
-    if os.path.exists("/proc/net/route"):
-        with open("/proc/net/route", "rt", encoding="ascii") as f:
-            routes = f.read().splitlines()[1:]
-        if any(len(row.split()) > 1 and row.split()[1] == "00000000" for row in routes):
-            fail("NETWORK_ROUTE_PRESENT")
     remaining = max(1, meta["deadline"] - int(time.time()))
     pre = _run_helper(["/usr/bin/python3", "-IB", "/usr/local/sbin/lab-fixture-digest"], remaining)
     pre_selected, pre_lines = _extract_anchor(pre)

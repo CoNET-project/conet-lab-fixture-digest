@@ -68,6 +68,109 @@ def valid_entry_output():
 
 
 class StageWindowTests(unittest.TestCase):
+    @staticmethod
+    def network_rows():
+        return {
+            ("link", "show"): [{"ifname": "lo", "flags": ["LOOPBACK", "UP"]}],
+            ("-4", "address", "show"): [{"ifname": "lo", "addr_info": [
+                {"family": "inet", "local": "127.0.0.1"}]}],
+            ("-6", "address", "show"): [{"ifname": "lo", "addr_info": [
+                {"family": "inet6", "local": "::1"}]}],
+            ("-4", "route", "show", "table", "all"): [],
+            ("-6", "route", "show", "table", "all"): [],
+        }
+
+    def test_network_gate_uses_current_namespace_json_and_allows_empty_route_data(self):
+        rows = self.network_rows()
+        calls = []
+
+        def read(args):
+            calls.append(tuple(args))
+            return rows[tuple(args)]
+
+        with mock.patch.object(MOD, "_ip_json", side_effect=read):
+            MOD._check_network_isolation()
+        self.assertEqual(calls, list(rows))
+        self.assertEqual(MOD._network_routes([], 4), "no_route_rows")
+        self.assertEqual(MOD._network_routes([], 6), "no_route_rows")
+
+    def test_network_gate_accepts_no_address_for_either_family_when_link_is_lo(self):
+        rows = self.network_rows()
+        rows[("-4", "address", "show")] = []
+        rows[("-6", "address", "show")] = []
+        with mock.patch.object(MOD, "_ip_json", side_effect=lambda args: rows[tuple(args)]):
+            MOD._check_network_isolation()
+
+    def test_network_gate_distinguishes_explicit_ipv6_unreachable_sentinel(self):
+        self.assertEqual(MOD._network_routes(
+            [{"type": "unreachable", "dst": "default"}], 6), "explicit_nonforwarding")
+        self.assertEqual(MOD._network_routes([], 6), "no_route_rows")
+        with self.assertRaises(MOD.Refusal) as caught:
+            MOD._network_routes(
+                [{"type": "unreachable", "dst": "default", "gateway": "2001:db8::1"}], 6)
+        self.assertEqual(caught.exception.category, "NETWORK_NAMESPACE_NOT_ISOLATED")
+        with self.assertRaises(MOD.Refusal) as caught:
+            MOD._network_routes([{"type": "unreachable", "gateway": None}], 6)
+        self.assertEqual(caught.exception.category, "NETWORK_STATE_UNAVAILABLE")
+
+    def test_network_gate_rejects_nonloopback_link_address_and_dual_stack_route(self):
+        cases = []
+        rows = self.network_rows()
+        rows[("link", "show")] = [
+            {"ifname": "lo", "flags": ["LOOPBACK"]},
+            {"ifname": "eth0", "flags": ["BROADCAST", "UP"]},
+        ]
+        cases.append((rows, "NETWORK_NAMESPACE_NOT_ISOLATED"))
+        rows = self.network_rows()
+        rows[("-4", "address", "show")] = [{"ifname": "lo", "addr_info": [
+            {"family": "inet", "local": "192.0.2.5"}]}]
+        cases.append((rows, "NETWORK_NAMESPACE_NOT_ISOLATED"))
+        rows = self.network_rows()
+        rows[("-4", "route", "show", "table", "all")] = [
+            {"dst": "default", "gateway": "192.0.2.1", "dev": "lo"}]
+        cases.append((rows, "NETWORK_ROUTE_PRESENT"))
+        rows = self.network_rows()
+        rows[("-6", "route", "show", "table", "all")] = [
+            {"dst": "2001:db8::/32", "gateway": "2001:db8::1", "dev": "lo"}]
+        cases.append((rows, "NETWORK_ROUTE_PRESENT"))
+
+        for index, (sample, expected_category) in enumerate(cases):
+            def read(args, sample=sample):
+                return sample[tuple(args)]
+            with self.subTest(case=index), mock.patch.object(MOD, "_ip_json", side_effect=read):
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._check_network_isolation()
+                self.assertEqual(caught.exception.category, expected_category)
+
+    def test_network_gate_rejects_missing_or_malformed_family_data(self):
+        rows = self.network_rows()
+        rows[("-6", "address", "show")] = [{"ifname": "lo"}]
+        with mock.patch.object(MOD, "_ip_json", side_effect=lambda args: rows[tuple(args)]):
+            with self.assertRaises(MOD.Refusal) as caught:
+                MOD._check_network_isolation()
+        self.assertEqual(caught.exception.category, "NETWORK_STATE_UNAVAILABLE")
+
+    def test_ip_json_distinguishes_empty_result_from_missing_or_failed_data(self):
+        empty = SimpleNamespace(returncode=0, stdout=b"[]\n")
+        with mock.patch.object(MOD.subprocess, "run", return_value=empty):
+            self.assertEqual(MOD._ip_json(["-6", "route", "show"]), [])
+        for result in (
+            SimpleNamespace(returncode=0, stdout=b""),
+            SimpleNamespace(returncode=2, stdout=b"[]\n"),
+            SimpleNamespace(returncode=0, stdout=b"{\"routes\": []}\n"),
+            SimpleNamespace(returncode=0, stdout=b"not-json\n"),
+        ):
+            with self.subTest(result=result), mock.patch.object(MOD.subprocess, "run", return_value=result):
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._ip_json(["-6", "route", "show"])
+                self.assertEqual(caught.exception.category, "NETWORK_STATE_UNAVAILABLE")
+        for failure in (FileNotFoundError(), MOD.subprocess.TimeoutExpired([MOD.IPROUTE2], 4)):
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(MOD.subprocess, "run", side_effect=failure):
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._ip_json(["-6", "route", "show"])
+                self.assertEqual(caught.exception.category, "NETWORK_STATE_UNAVAILABLE")
+
     def test_watchdog_exec_and_close_identity_are_exact(self):
         run_dir = "/run/lab-g3-archive-a-20261124T040000Z-abcdef123456"
         source_checkout = "/var/tmp/lab-archive-a-src.Synth001"
