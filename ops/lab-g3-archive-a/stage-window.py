@@ -545,7 +545,8 @@ def _entry(role):
         fail("NAMESPACE_UNAVAILABLE")
     if result.returncode != 0:
         # Do not echo arbitrary subprocess output on failure.
-        print("STATUS=FAIL CATEGORY=READ_ENTRY_FAILED")
+        category = _fixed_failure_category(result.stdout)
+        print("STATUS=FAIL CATEGORY=" + (category or "READ_ENTRY_FAILED"))
         return 1
     output = result.stdout.decode("utf-8", "strict")
     if len(result.stdout) > MAX_HELPER_OUTPUT:
@@ -564,6 +565,17 @@ def _entry(role):
     except FileExistsError:
         fail("SEAT_COMPLETION_ALREADY_RECORDED")
     return 0
+
+
+def _fixed_failure_category(output):
+    if not isinstance(output, bytes) or len(output) > 128:
+        return None
+    match = re.fullmatch(rb"STATUS=FAIL CATEGORY=([A-Z][A-Z0-9_]{0,63})\n", output)
+    return match.group(1).decode("ascii") if match else None
+
+
+def _watchdog_exec_argv(run_dir):
+    return ["/usr/bin/python3", "-IB", os.path.join(run_dir, "stage-window.py"), "watchdog"]
 
 
 def _validate_entry_output(output, meta):
@@ -928,13 +940,16 @@ def _start_watchdog(run_dir, deadline):
             os.dup2(devnull, 2)
             if devnull > 2:
                 os.close(devnull)
-            _write_new(os.path.join(run_dir, "watchdog.pid"), str(os.getpid()) + "\n", 0o600)
-            while int(time.time()) < deadline:
-                time.sleep(min(1.0, max(0.05, deadline - time.time())))
-            _expire_window()
+            meta = _load_meta(run_dir)
+            if meta["deadline"] != deadline:
+                os._exit(1)
+            os.chdir(meta["source_checkout"])
+            argv = _watchdog_exec_argv(run_dir)
+            env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C",
+                   "PYTHONDONTWRITEBYTECODE": "1"}
+            os.execve(argv[0], argv, env)
         except BaseException:
             os._exit(1)
-        os._exit(0)
     ready = os.path.join(run_dir, "watchdog.pid")
     for _ in range(100):
         if os.path.exists(ready):
@@ -1102,8 +1117,7 @@ def _close_locked(active, meta, run_dir):
             except OSError:
                 fail("WATCHDOG_IDENTITY_MISMATCH")
             if cmd is not None:
-                expected_script = os.path.join(run_dir, "stage-window.py").encode()
-                if not cmd or expected_script not in cmd or cwd != meta["source_checkout"]:
+                if not _watchdog_identity_matches(cmd, cwd, run_dir, meta["source_checkout"]):
                     fail("WATCHDOG_IDENTITY_MISMATCH")
                 try:
                     os.kill(watchdog_pid, signal.SIGTERM)
@@ -1182,6 +1196,12 @@ def _assert_no_window_processes(run_dir, self_pid):
             # The watchdog is stopped before this check. Any other process
             # still rooted in the temporary session blocks removal.
             fail("WINDOW_PROCESS_ACTIVE")
+
+
+def _watchdog_identity_matches(cmd, cwd, run_dir, source_checkout):
+    expected = [b"/usr/bin/python3", b"-IB",
+                os.path.join(run_dir, "stage-window.py").encode("utf-8"), b"watchdog"]
+    return cmd == expected and cwd == source_checkout
 
 
 def _readback():
@@ -1320,14 +1340,11 @@ def main(argv=None):
         if len(argv) == 2 and argv[0] == "inner":
             return _inner(argv[1])
         if argv == ["watchdog"]:
-            _check_root()
-            active = _active_read()
-            while int(time.time()) < active["deadline"]:
-                time.sleep(min(1.0, max(0.05, active["deadline"] - time.time())))
-            _expire_window()
-            return 0
+            return _watchdog()
         if argv == ["close"]:
             return _close()
+        if argv == ["readback"]:
+            return _readback()
         print("STATUS=FAIL CATEGORY=ARGUMENTS")
         return 2
     except Refusal as exc:
@@ -1336,6 +1353,22 @@ def main(argv=None):
     except Exception:
         print("STATUS=FAIL CATEGORY=INTERNAL")
         return 1
+
+
+def _watchdog():
+    _check_root()
+    active = _active_read()
+    run_dir = active["run_dir"]
+    if os.getcwd() != active["source_checkout"]:
+        fail("WATCHDOG_IDENTITY_MISMATCH")
+    watchdog_path = os.path.join(run_dir, "watchdog.pid")
+    if os.path.lexists(watchdog_path):
+        fail("WATCHDOG_RECORD_EXISTS")
+    _write_new(watchdog_path, str(os.getpid()) + "\n", 0o600)
+    while int(time.time()) < active["deadline"]:
+        time.sleep(min(1.0, max(0.05, active["deadline"] - time.time())))
+    _expire_window()
+    return 0
 
 
 if __name__ == "__main__":

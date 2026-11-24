@@ -68,6 +68,38 @@ def valid_entry_output():
 
 
 class StageWindowTests(unittest.TestCase):
+    def test_watchdog_exec_and_close_identity_are_exact(self):
+        run_dir = "/run/lab-g3-archive-a-20261124T040000Z-abcdef123456"
+        source_checkout = "/var/tmp/lab-archive-a-src.Synth001"
+        script = (run_dir + "/stage-window.py").encode()
+        self.assertEqual(MOD._watchdog_exec_argv(run_dir),
+                         ["/usr/bin/python3", "-IB", run_dir + "/stage-window.py", "watchdog"])
+        self.assertTrue(MOD._watchdog_identity_matches(
+            [b"/usr/bin/python3", b"-IB", script, b"watchdog"], source_checkout,
+            run_dir, source_checkout))
+        self.assertFalse(MOD._watchdog_identity_matches(
+            [b"/usr/bin/python3", b"-IB", script, b"prepare"], source_checkout,
+            run_dir, source_checkout))
+        self.assertFalse(MOD._watchdog_identity_matches(
+            [b"/usr/bin/python3", b"-IB", script, b"watchdog"], "/wrong/cwd",
+            run_dir, source_checkout))
+
+    def test_readback_is_dispatched_without_running_host_checks(self):
+        with mock.patch.dict(MOD.os.environ, {"KEEP_FOR_TEST": "yes"}, clear=True):
+            with mock.patch.object(MOD, "_readback", return_value=23) as readback:
+                self.assertEqual(MOD.main(["readback"]), 23)
+            readback.assert_called_once_with()
+
+    def test_entry_only_relays_fixed_inner_failure_categories(self):
+        self.assertEqual(MOD._fixed_failure_category(b"STATUS=FAIL CATEGORY=ANCHOR_CHANGED\n"),
+                         "ANCHOR_CHANGED")
+        self.assertEqual(MOD._fixed_failure_category(b"STATUS=FAIL CATEGORY=INTERNAL\n"), "INTERNAL")
+        for output in (b"secret site value\n", b"STATUS=FAIL CATEGORY=ANCHOR_CHANGED\nSECRET\n",
+                       b"STATUS=FAIL CATEGORY=lowercase\n", b"STATUS=FAIL CATEGORY=BAD\nDETAIL=private\n",
+                       b"STATUS=FAIL CATEGORY=" + b"A" * 65 + b"\n", b"x" * 129):
+            with self.subTest(output=output[:32]):
+                self.assertIsNone(MOD._fixed_failure_category(output))
+
     def test_git_identity_is_owner_only_for_root_and_owner_callers(self):
         self.assertEqual(MOD._git_identity(1001, 1001, [1001, 1002, 1001], 0),
                          {"user": 1001, "group": 1001, "extra_groups": [1001, 1002]})

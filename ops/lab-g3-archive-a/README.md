@@ -59,7 +59,11 @@ archive helper does not attest the V2 or four input rows.
 ## Deadline and close
 
 The helper and entry wrapper check the fixed expiry. A root watchdog removes
-the exact sudoers drop-in at expiry. `close` stops that watchdog, verifies
+the exact sudoers drop-in at expiry. The watchdog is exec'd as the fixed
+`stage-window.py watchdog` command from the verified checkout directory, so
+its recorded process identity matches the close check. A failed read entry
+may relay only one strict fixed-format `STATUS=FAIL CATEGORY=...` token from
+the inner controller; arbitrary helper output is discarded. `close` stops that watchdog, verifies
 and removes only the exact installed rule, validates sudoers, removes only
 the temporary staging tree, and leaves a small root-only close record plus
 the clean GitHub checkout for independent review. A second administrator
