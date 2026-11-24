@@ -166,15 +166,41 @@ def validate_bootstrap(obj, now=None):
     return remaining
 
 
-def _git_read(checkout, args):
-    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C",
-           "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0",
-           "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat"}
+def _git_identity(expected_uid, expected_gid, supplementary_groups, current_euid):
+    if type(expected_uid) is not int or expected_uid <= 0 or type(expected_gid) is not int or expected_gid < 0:
+        fail("SOURCE_GIT_IDENTITY")
+    if (not isinstance(supplementary_groups, list) or
+            any(type(group) is not int or group < 0 for group in supplementary_groups)):
+        fail("SOURCE_GIT_IDENTITY")
+    if current_euid == 0:
+        return {"user": expected_uid, "group": expected_gid,
+                "extra_groups": sorted(set(supplementary_groups))}
+    if current_euid == expected_uid:
+        return {}
+    fail("SOURCE_GIT_IDENTITY")
+
+
+def _git_read(checkout, args, expected_uid):
+    if args not in (["rev-parse", "HEAD"],
+                    ["status", "--porcelain=v1", "--untracked-files=all"]):
+        fail("SOURCE_GIT_QUERY")
+    try:
+        owner = pwd.getpwuid(expected_uid)
+        groups = os.getgrouplist(owner.pw_name, owner.pw_gid)
+        identity = _git_identity(expected_uid, owner.pw_gid, groups, os.geteuid())
+    except Refusal:
+        raise
+    except Exception:
+        fail("SOURCE_GIT_IDENTITY")
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C", "HOME": "/nonexistent",
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat"}
     try:
         result = subprocess.run(["/usr/bin/git", "-c", "core.hooksPath=/dev/null",
                                  "-c", "core.fsmonitor=false", "-C", checkout, *args],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, env=env, timeout=8, check=False)
+                                stderr=subprocess.DEVNULL, env=env, timeout=8, check=False,
+                                **identity)
     except Exception:
         fail("SOURCE_GIT_UNAVAILABLE")
     if result.returncode:
@@ -186,13 +212,17 @@ def verify_source(checkout, expected_commit, expected_uid):
     if not os.path.isabs(checkout) or not SOURCE_PATH.fullmatch(checkout):
         fail("SOURCE_PATH_POLICY")
     st = os.lstat(checkout)
+    try:
+        owner = pwd.getpwuid(expected_uid)
+    except KeyError:
+        fail("SOURCE_DIRECTORY")
     if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or
-            os.path.realpath(checkout) != checkout or st.st_uid != expected_uid or
+            os.path.realpath(checkout) != checkout or st.st_uid != expected_uid or st.st_gid != owner.pw_gid or
             stat.S_IMODE(st.st_mode) != 0o700):
         fail("SOURCE_DIRECTORY")
-    if _git_read(checkout, ["rev-parse", "HEAD"]) != expected_commit:
+    if _git_read(checkout, ["rev-parse", "HEAD"], expected_uid) != expected_commit:
         fail("SOURCE_COMMIT_MISMATCH")
-    if _git_read(checkout, ["status", "--porcelain=v1", "--untracked-files=all"]):
+    if _git_read(checkout, ["status", "--porcelain=v1", "--untracked-files=all"], expected_uid):
         fail("SOURCE_DIRTY")
     expected_script = os.path.join(checkout, "ops", "lab-g3-archive-a", "stage-window.py")
     if SCRIPT != expected_script or _file_sha256(SCRIPT) != _file_sha256(expected_script):
@@ -1011,7 +1041,8 @@ def _remove_checkout(path, expected_commit, expected_uid):
             st.st_uid != expected_uid or stat.S_IMODE(st.st_mode) != 0o700 or
             os.path.realpath(path) != path):
         fail("CHECKOUT_CLEANUP_REFUSED")
-    if _git_read(path, ["rev-parse", "HEAD"]) != expected_commit or _git_read(path, ["status", "--porcelain=v1", "--untracked-files=all"]):
+    if (_git_read(path, ["rev-parse", "HEAD"], expected_uid) != expected_commit or
+            _git_read(path, ["status", "--porcelain=v1", "--untracked-files=all"], expected_uid)):
         fail("CHECKOUT_CLEANUP_REFUSED")
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
         fail("SAFE_RMTREE_UNAVAILABLE")

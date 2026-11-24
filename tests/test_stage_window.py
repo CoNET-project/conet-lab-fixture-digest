@@ -5,6 +5,8 @@ import json
 import pathlib
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.dont_write_bytecode = True
 HERE = pathlib.Path(__file__).resolve()
@@ -66,6 +68,51 @@ def valid_entry_output():
 
 
 class StageWindowTests(unittest.TestCase):
+    def test_git_identity_is_owner_only_for_root_and_owner_callers(self):
+        self.assertEqual(MOD._git_identity(1001, 1001, [1001, 1002, 1001], 0),
+                         {"user": 1001, "group": 1001, "extra_groups": [1001, 1002]})
+        self.assertEqual(MOD._git_identity(1001, 1001, [1001, 1002], 1001), {})
+        with self.assertRaises(MOD.Refusal) as caught:
+            MOD._git_identity(1001, 1001, [1001, 1002], 1002)
+        self.assertEqual(caught.exception.category, "SOURCE_GIT_IDENTITY")
+
+    def test_git_identity_rejects_invalid_identity_and_query(self):
+        for uid, gid, groups, euid in (
+            (0, 0, [0], 0),
+            (1001, -1, [1001], 0),
+            (1001, 1001, ["1001"], 0),
+        ):
+            with self.subTest(uid=uid, gid=gid), self.assertRaises(MOD.Refusal):
+                MOD._git_identity(uid, gid, groups, euid)
+        with self.assertRaises(MOD.Refusal) as caught:
+            MOD._git_read("/var/tmp/lab-archive-a-src.Synth001", ["config", "--list"], 1001)
+        self.assertEqual(caught.exception.category, "SOURCE_GIT_QUERY")
+
+    def test_root_git_read_drops_to_verified_checkout_owner(self):
+        uid = MOD.os.getuid()
+        owner = MOD.pwd.getpwuid(uid)
+        fake = SimpleNamespace(returncode=0, stdout=b"synthetic\n")
+        with mock.patch.object(MOD.os, "geteuid", return_value=0), \
+             mock.patch.object(MOD.subprocess, "run", return_value=fake) as run_git:
+            self.assertEqual(MOD._git_read("/var/tmp/lab-archive-a-src.Synth001",
+                                           ["rev-parse", "HEAD"], uid), "synthetic")
+        kwargs = run_git.call_args.kwargs
+        self.assertEqual(kwargs["user"], uid)
+        self.assertEqual(kwargs["group"], owner.pw_gid)
+        self.assertEqual(kwargs["extra_groups"], sorted(set(MOD.os.getgrouplist(owner.pw_name, owner.pw_gid))))
+        self.assertEqual(kwargs["env"]["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertNotIn("safe.directory", kwargs["env"])
+
+    def test_owner_git_read_keeps_owner_identity(self):
+        uid = MOD.os.getuid()
+        fake = SimpleNamespace(returncode=0, stdout=b"\n")
+        with mock.patch.object(MOD.os, "geteuid", return_value=uid), \
+             mock.patch.object(MOD.subprocess, "run", return_value=fake) as run_git:
+            self.assertEqual(MOD._git_read("/var/tmp/lab-archive-a-src.Synth001",
+                                           ["status", "--porcelain=v1", "--untracked-files=all"], uid), "")
+        self.assertNotIn("user", run_git.call_args.kwargs)
+        self.assertNotIn("group", run_git.call_args.kwargs)
+
     def test_two_seat_completion_state_machine(self):
         stamp = b"ROLE=field\nDONE_UTC=2026-11-23T00:00:00Z\nOUTPUT_SHA256=" + b"a" * 64 + b"\n"
         self.assertTrue(MOD._seat_marker_state(b"started\n", stamp, "field"))
@@ -193,6 +240,7 @@ class StageWindowTests(unittest.TestCase):
         self.assertNotIn("/var/tmp/lab-g3-synth-20261123", text)
         self.assertNotIn("d00a55f892852152", text)
         self.assertNotIn("70.35.205.77", text)
+        self.assertNotIn("safe.directory", text)
         self.assertIn(MOD.ENGINE_SHA256, text)
         self.assertIn(MOD.ARCHIVE_SHA256, text)
 

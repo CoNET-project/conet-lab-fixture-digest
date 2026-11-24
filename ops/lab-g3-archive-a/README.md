@@ -22,7 +22,9 @@ published helper's strict configuration schema.
 
 The administrator runs `stage-window.py prepare` from the clean GitHub
 checkout matching the bootstrap commit. It verifies the two helper hashes,
-checkout state, private bootstrap metadata, absent host config path, and
+checkout ownership and state (fixed read-only Git queries run as the verified
+checkout owner with a clean environment, without `safe.directory`), private
+bootstrap metadata, absent host config path, and
 sudoers directory before creating anything. It creates one uniquely named
 root-owned `/run/lab-g3-archive-a-*` tree and one exact sudoers drop-in for
 the no-argument `field` and `review` entrypoints. The entrypoints are
