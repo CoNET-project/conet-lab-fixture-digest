@@ -13,6 +13,7 @@ import json
 import os
 import pwd
 import re
+import select
 import shutil
 import signal
 import stat
@@ -23,6 +24,7 @@ import uuid
 
 BOOTSTRAP = "/run/lab-g3-archive-a-bootstrap.json"
 ACTIVE = "/run/lab-g3-archive-a-active.json"
+INSTALL_SPEC = "/run/lab-g3-archive-a-install.json"
 SUDOERS_DIR = "/etc/sudoers.d"
 ENGINE_REL = "assets/lab-g3-fixture-summary.py"
 ARCHIVE_REL = "assets/lab-g3-fixture-archive-summary.py"
@@ -34,6 +36,7 @@ BOOTSTRAP_KEYS = {
     "valid_until_epoch", "fixture_root", "v2_manifest_sha256",
     "v2_selected_tree_sha256", "v2_generation", "v2_previous_generation",
     "archive_manifest_sha256", "archive_wal_sha256",
+    "root_entry_path", "root_entry_sha256",
 }
 CONFIG_KEYS = {
     "schema_version", "fixture_root", "v2_manifest_sha256",
@@ -44,14 +47,29 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 GEN = re.compile(r"^gen-\d{8}T\d{6}Z-[0-9a-f]{12}$")
 FIXTURE = re.compile(r"^/var/tmp/lab-g3-synth-[A-Za-z0-9T-]+-[a-f0-9]{6}$")
 SOURCE_PATH = re.compile(r"^/var/tmp/lab-archive-a-src\.[A-Za-z0-9]{8}$")
+ROOT_ENTRY_PATH = re.compile(r"^/run/lab-g3-archive-a-loader-[0-9a-f]{12}\.py$")
 RUN_NAME = re.compile(r"^lab-g3-archive-a-\d{8}T\d{6}Z-[a-f0-9]{12}$")
 RUN_BASE = "/run"
+TERMINAL_BASE = "/run/lab-g3-archive-a-terminal"
+TERMINAL_NAME = re.compile(r"^(lab-g3-archive-a-\d{8}T\d{6}Z-[a-f0-9]{12})\.journal$")
+TERMINAL_COMPLETE_NAME = re.compile(r"^lab-g3-archive-a-\d{8}T\d{6}Z-[a-f0-9]{12}\.complete\.json$")
+TERMINAL_PHASES = (
+    "RUNNING", "INTENT", "RULE_INTENT", "RULE_DONE", "WATCHDOG_INTENT",
+    "WATCHDOG_DONE", "QUIESCENCE_DONE", "BOOTSTRAP_INTENT", "BOOTSTRAP_DONE",
+    "ACTIVE_INTENT", "ACTIVE_DONE", "RUN_VERIFY", "RUN_INTENT", "RUN_DONE",
+    "CHECKOUT_VERIFY", "CHECKOUT_VERIFIED", "CHECKOUT_INTENT", "CHECKOUT_DONE",
+    "POSTCHECK_PASS", "COMPLETE", "READBACK_DONE",
+)
 MAX_WINDOW_SECONDS = 900
 MIN_WINDOW_SECONDS = 60
 MAX_HELPER_OUTPUT = 8 * 1024 * 1024
 IPROUTE2 = "/usr/sbin/ip"
 MAX_NETWORK_OUTPUT = 1024 * 1024
+TERMINAL_UID = 0
+TERMINAL_GID = 0
 SCRIPT = os.path.realpath(__file__)
+ROOT_ENTRY_BINDING = None
+WATCHDOG_START_UNCERTAIN = False
 
 
 class Refusal(Exception):
@@ -142,6 +160,11 @@ def validate_bootstrap(obj, now=None):
     if not isinstance(obj.get("source_commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", obj["source_commit"]):
         fail("BOOTSTRAP_SCHEMA")
     if not isinstance(obj.get("stage_script_sha256"), str) or not HEX64.fullmatch(obj["stage_script_sha256"]):
+        fail("BOOTSTRAP_SCHEMA")
+    if (not isinstance(obj.get("root_entry_path"), str) or
+            not ROOT_ENTRY_PATH.fullmatch(obj["root_entry_path"]) or
+            not isinstance(obj.get("root_entry_sha256"), str) or
+            not HEX64.fullmatch(obj["root_entry_sha256"])):
         fail("BOOTSTRAP_SCHEMA")
     until = obj.get("valid_until_epoch")
     if type(until) is not int:
@@ -244,6 +267,44 @@ def _g3_config(bootstrap):
     return {key: bootstrap[key] for key in CONFIG_KEYS}
 
 
+def _require_root_entry(verb, path, expected_sha):
+    binding = ROOT_ENTRY_BINDING
+    if (not isinstance(binding, dict) or set(binding) != {
+                "path", "sha256", "verb", "terminal_dir", "terminal_phase"} or
+            binding["verb"] != verb or binding["path"] != path or
+            binding["sha256"] != expected_sha or not ROOT_ENTRY_PATH.fullmatch(path)):
+        fail("ROOT_ENTRY_REQUIRED")
+    if verb == "prepare":
+        if binding["terminal_dir"] is not None or binding["terminal_phase"] is not None:
+            fail("ROOT_ENTRY_REQUIRED")
+    elif (not isinstance(binding["terminal_dir"], str) or
+          not TERMINAL_NAME.fullmatch(os.path.basename(binding["terminal_dir"])) or
+          binding["terminal_phase"] not in TERMINAL_PHASES):
+        fail("ROOT_ENTRY_REQUIRED")
+    try:
+        st = os.lstat(path)
+        if (not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or
+                st.st_gid != 0 or stat.S_IMODE(st.st_mode) != 0o500 or st.st_nlink != 1 or
+                os.path.realpath(path) != path):
+            fail("ROOT_ENTRY_METADATA")
+        if _file_sha256(path) != expected_sha:
+            fail("ROOT_ENTRY_HASH")
+    except Refusal:
+        raise
+    except Exception:
+        fail("ROOT_ENTRY_UNAVAILABLE")
+
+
+def _remove_root_entry(path, expected_sha):
+    _require_root_entry("readback", path, expected_sha)
+    try:
+        os.unlink(path)
+    except OSError:
+        fail("ROOT_ENTRY_REMOVE")
+    if os.path.lexists(path):
+        fail("ROOT_ENTRY_REMOVE")
+
+
 def _sudoers_text(operator, run_dir):
     return (operator + " ALL=(root) NOPASSWD: " + run_dir + "/field \"\", " +
             run_dir + "/review \"\"\n")
@@ -256,22 +317,26 @@ def _entry_wrapper(run_dir, role):
             "exec /usr/bin/python3 -IB " + run_dir + "/stage-window.py entry " + role + "\n")
 
 
-def _write_new(path, content, mode=0o600):
+def _write_new(path, content, mode=0o600, created=None):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
     try:
         os.fchown(fd, 0, 0)
         os.fchmod(fd, mode)
         data = content if isinstance(content, bytes) else content.encode("utf-8")
+        if created is not None:
+            created(path, "opened", _meta(os.fstat(fd)), hashlib.sha256(data).hexdigest(), mode)
         view = memoryview(data)
         while view:
             written = os.write(fd, view)
             view = view[written:]
         os.fsync(fd)
+        if created is not None:
+            created(path, "written", _meta(os.fstat(fd)), hashlib.sha256(data).hexdigest(), mode)
     finally:
         os.close(fd)
 
 
-def _write_new_from_file(src, dst, expected_sha, mode=0o555):
+def _write_new_from_file(src, dst, expected_sha, mode=0o555, created=None):
     fd_in = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC |
                     getattr(os, "O_NOATIME", 0))
     try:
@@ -290,7 +355,7 @@ def _write_new_from_file(src, dst, expected_sha, mode=0o555):
             fail("SOURCE_HASH_MISMATCH")
     finally:
         os.close(fd_in)
-    _write_new(dst, bytes(data), mode)
+    _write_new(dst, bytes(data), mode, created=created)
 
 
 def _sudoers_check(path):
@@ -380,11 +445,20 @@ def _host_snapshots():
 def _prepare():
     _check_root()
     _host_preflight()
+    # The external installer consumes its fixed spec only after both the
+    # loader and its receipt have passed readback. A leftover spec means that
+    # install did not reach that commit point; resume/reconcile it first.
+    if os.path.lexists(INSTALL_SPEC):
+        fail("INSTALL_SPEC_PENDING")
+    # A durable incomplete terminal journal must stop preparation before the
+    # controller creates any run-tree or ACTIVE files.
+    _terminal_preflight()
     raw, bootstrap_meta = _read_regular(BOOTSTRAP, 0, 0o600, 65536)
     bootstrap = _json_exact(raw, BOOTSTRAP_KEYS, "BOOTSTRAP_SCHEMA")
     ttl = validate_bootstrap(bootstrap)
     if _file_sha256(SCRIPT) != bootstrap["stage_script_sha256"]:
         fail("STAGE_SCRIPT_HASH_MISMATCH")
+    _require_root_entry("prepare", bootstrap["root_entry_path"], bootstrap["root_entry_sha256"])
     operator = bootstrap["operator"]
     try:
         pw = pwd.getpwnam(operator)
@@ -407,8 +481,10 @@ def _prepare():
     os.chmod(run_dir, 0o700)
     sudoers_created = False
     active_created = False
+    terminal_created = False
     watchdog_started = False
     rule_sha = None
+    terminal_dir = None
     try:
         payload = os.path.join(run_dir, "payload")
         os.mkdir(payload, 0o700)
@@ -438,8 +514,11 @@ def _prepare():
         rule_sha = hashlib.sha256(rule.encode("utf-8")).hexdigest()
         meta = {
             "schema_version": 1, "run_dir": run_dir, "run_name": run_name,
+            "terminal_dir": _terminal_dir_for(run_name),
             "source_checkout": bootstrap["source_checkout"], "source_commit": bootstrap["source_commit"],
             "operator_uid": pw.pw_uid, "deadline": bootstrap["valid_until_epoch"],
+            "root_entry_path": bootstrap["root_entry_path"],
+            "root_entry_sha256": bootstrap["root_entry_sha256"],
             "input_sha256": bootstrap["input_sha256"],
             "sudoers_path": sudoers_path, "sudoers_sha256": rule_sha,
             "config_sha256": hashlib.sha256(config_blob).hexdigest(),
@@ -451,13 +530,23 @@ def _prepare():
         }
         _write_new(os.path.join(run_dir, "meta.json"), json.dumps(meta, sort_keys=True, separators=(",", ":")) + "\n", 0o600)
         _write_new(ACTIVE, json.dumps({"run_dir": run_dir, "run_name": run_name,
+                                       "terminal_dir": _terminal_dir_for(run_name),
                                        "source_checkout": bootstrap["source_checkout"],
                                        "deadline": bootstrap["valid_until_epoch"],
+                                       "source_commit": bootstrap["source_commit"],
+                                       "stage_script_sha256": bootstrap["stage_script_sha256"],
+                                       "operator_uid": pw.pw_uid,
+                                       "root_entry_path": bootstrap["root_entry_path"],
+                                       "root_entry_sha256": bootstrap["root_entry_sha256"],
                                        "sudoers_path": sudoers_path,
                                        "sudoers_sha256": rule_sha}, sort_keys=True, separators=(",", ":")) + "\n", 0o600)
         active_created = True
-        _start_watchdog(run_dir, bootstrap["valid_until_epoch"])
+        terminal_dir = _terminal_create(_active_read(), meta,
+                                        hashlib.sha256(_read_regular(ACTIVE, 0, 0o600, 8192)[0]).hexdigest(),
+                                        hashlib.sha256(_read_regular(os.path.join(run_dir, "meta.json"), 0, 0o600, 65536)[0]).hexdigest())
+        terminal_created = True
         watchdog_started = True
+        _start_watchdog(run_dir, bootstrap["valid_until_epoch"])
         _write_new(sudoers_path, rule, 0o440)
         sudoers_created = True
         result = subprocess.run(["/usr/sbin/visudo", "-c", "-q"], stdin=subprocess.DEVNULL,
@@ -474,8 +563,10 @@ def _prepare():
         print("STATUS=STAGED")
         print("ENTRY_FIELD=" + run_dir + "/field")
         print("ENTRY_REVIEW=" + run_dir + "/review")
-        print("CLOSE=sudo -n /usr/bin/python3 -IB " + bootstrap["source_checkout"] + "/ops/lab-g3-archive-a/stage-window.py close")
-        print("READBACK=sudo -n /usr/bin/python3 -IB " + bootstrap["source_checkout"] + "/ops/lab-g3-archive-a/stage-window.py readback")
+        print("ROOT_ENTRY=" + bootstrap["root_entry_path"])
+        print("ABORT=/usr/bin/python3 -IB " + bootstrap["root_entry_path"] + " abort")
+        print("CLOSE=/usr/bin/python3 -IB " + bootstrap["root_entry_path"] + " close")
+        print("READBACK=/usr/bin/python3 -IB " + bootstrap["root_entry_path"] + " readback")
         print("DEADLINE_EPOCH=" + str(bootstrap["valid_until_epoch"]))
         print("SOURCE_COMMIT=" + bootstrap["source_commit"])
         print("CONFIG_SHA256=" + meta["config_sha256"])
@@ -483,17 +574,31 @@ def _prepare():
         print("TRUST_MODEL=existing administrator permissions unchanged; exact temporary entries are workflow restrictions")
         return 0
     except Exception:
+        if WATCHDOG_START_UNCERTAIN:
+            # A child may still be alive but cannot be addressed safely.
+            # Preserve its run and bootstrap for identity-bound recovery.
+            fail("PREPARE_WATCHDOG_CLEANUP_PENDING")
+        if active_created and terminal_dir is None and os.path.lexists(_terminal_dir_for(run_name)):
+            # Terminal creation may have left an unrecognized partial node.
+            # Preserve its bindings and all dependent inputs for explicit
+            # recovery; never erase the context needed to inspect that node.
+            fail("PREPARE_TERMINAL_CLEANUP_PENDING")
         if sudoers_created and rule_sha and os.path.lexists(sudoers_path):
             try:
                 if _file_sha256(sudoers_path) == rule_sha:
                     os.unlink(sudoers_path)
             except Exception:
                 pass
-        if watchdog_started:
-            _best_effort_stop_watchdog(run_dir)
+        watchdog_stopped = not watchdog_started or _best_effort_stop_watchdog(run_dir)
+        if not watchdog_stopped:
+            # Preserve ACTIVE/run/bootstrap for explicit, identity-bound
+            # recovery. Never remove a directory a watchdog may still use.
+            fail("PREPARE_WATCHDOG_CLEANUP_PENDING")
         if active_created:
             _best_effort_remove(ACTIVE)
         _best_effort_remove_tree(run_dir)
+        if terminal_created and terminal_dir:
+            _best_effort_remove_terminal(terminal_dir, run_name)
         raise
 
 
@@ -523,51 +628,85 @@ def _entry(role):
     run_name = os.path.basename(run_dir)
     if not RUN_NAME.fullmatch(run_name) or not os.path.realpath(run_dir) == run_dir:
         fail("RUN_PATH_POLICY")
-    meta = _load_meta(run_dir)
-    if int(time.time()) >= meta["deadline"]:
-        fail("WINDOW_EXPIRED")
-    marker = os.path.join(run_dir, "seat." + role)
+    lockfd = _locked(run_dir)
     try:
+        active = _active_read()
+        meta = _load_meta(run_dir)
+        _check_active_meta(active, meta, "entry")
+        _reject_aborting(run_dir)
+        if int(time.time()) >= meta["deadline"]:
+            fail("WINDOW_EXPIRED")
+        marker = os.path.join(run_dir, "seat." + role)
+        if os.path.lexists(marker) or os.path.lexists(marker + ".done"):
+            fail("SEAT_ALREADY_USED")
         _write_new(marker, "started\n", 0o600)
-    except FileExistsError:
-        fail("SEAT_ALREADY_USED")
-    # The only privileged command exposed by sudoers is this fixed no-argument
-    # wrapper. The wrapper starts a fresh private mount and network namespace.
+        argv = ["/usr/bin/unshare", "--mount", "--net", "--propagation", "private", "--",
+                "/usr/bin/python3", "-IB", os.path.join(run_dir, "stage-window.py"),
+                "inner", role]
+        # Launch while holding control.lock. The inner process must acquire the
+        # same lock and record its entered marker before it can read anything.
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL,
+                                   env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C",
+                                        "PYTHONDONTWRITEBYTECODE": "1"}, start_new_session=True)
+        launch_record = {
+            "role": role, "entry_pid": process.pid,
+            "entry_starttime": _process_starttime(process.pid),
+            "requested_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "state": "launching",
+        }
+        _write_new(os.path.join(run_dir, "entry." + role + ".json"),
+                   json.dumps(launch_record, sort_keys=True, separators=(",", ":")) + "\n", 0o600)
+    except Exception:
+        os.close(lockfd)
+        raise
+    else:
+        os.close(lockfd)
     try:
-        result = subprocess.run(["/usr/bin/unshare", "--mount", "--net", "--propagation", "private", "--",
-                                 "/usr/bin/python3", "-IB", os.path.join(run_dir, "stage-window.py"),
-                                 "inner", role], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C",
-                                     "PYTHONDONTWRITEBYTECODE": "1"},
-                                timeout=max(1, meta["deadline"] - int(time.time())), check=False)
+        output, _ = process.communicate(timeout=max(1, meta["deadline"] - int(time.time())))
     except subprocess.TimeoutExpired:
+        _terminate_child_pidfd(process, launch_record["entry_starttime"])
+        output, _ = process.communicate()
         print("STATUS=FAIL CATEGORY=WINDOW_EXPIRED")
         return 1
     except Exception:
         fail("NAMESPACE_UNAVAILABLE")
-    if result.returncode != 0:
+    if process.returncode != 0:
         # Do not echo arbitrary subprocess output on failure.
-        category = _fixed_failure_category(result.stdout)
+        category = _fixed_failure_category(output)
         print("STATUS=FAIL CATEGORY=" + (category or "READ_ENTRY_FAILED"))
         return 1
-    output = result.stdout.decode("utf-8", "strict")
-    if len(result.stdout) > MAX_HELPER_OUTPUT:
+    if len(output) > MAX_HELPER_OUTPUT:
         print("STATUS=FAIL CATEGORY=READ_OUTPUT_INVALID")
         return 1
-    _validate_entry_output(output, meta)
-    if int(time.time()) >= meta["deadline"]:
-        fail("WINDOW_EXPIRED")
-    sys.stdout.write(output)
-    sys.stdout.flush()
-    completed = ("ROLE=" + role + "\nDONE_UTC=" +
-                 datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") +
-                 "\nOUTPUT_SHA256=" + hashlib.sha256(result.stdout).hexdigest() + "\n")
     try:
+        output_text = output.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        print("STATUS=FAIL CATEGORY=READ_OUTPUT_INVALID")
+        return 1
+    lockfd = _locked(run_dir)
+    try:
+        active = _active_read()
+        meta = _load_meta(run_dir)
+        _check_active_meta(active, meta, "entry")
+        if _is_aborting(run_dir):
+            print("STATUS=FAIL CATEGORY=WINDOW_ABORTED")
+            return 1
+        if int(time.time()) >= meta["deadline"]:
+            print("STATUS=FAIL CATEGORY=WINDOW_EXPIRED")
+            return 1
+        _validate_entry_output(output_text, meta)
+        completed = ("ROLE=" + role + "\nDONE_UTC=" +
+                     datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") +
+                     "\nOUTPUT_SHA256=" + hashlib.sha256(output).hexdigest() + "\n")
         _write_new(os.path.join(run_dir, "seat." + role + ".done"), completed, 0o600)
+        sys.stdout.write(output_text)
+        sys.stdout.flush()
+        return 0
     except FileExistsError:
         fail("SEAT_COMPLETION_ALREADY_RECORDED")
-    return 0
+    finally:
+        os.close(lockfd)
 
 
 def _fixed_failure_category(output):
@@ -678,16 +817,711 @@ def _close_seat_status(field_complete, review_complete, expired):
 def _load_meta(run_dir):
     raw, _ = _read_regular(os.path.join(run_dir, "meta.json"), 0, 0o600, 65536)
     obj = _json_exact(raw, {
-        "schema_version", "run_dir", "run_name", "source_checkout", "source_commit",
+        "schema_version", "run_dir", "run_name", "terminal_dir", "source_checkout", "source_commit",
         "operator_uid", "deadline", "sudoers_path", "sudoers_sha256", "config_sha256",
+        "root_entry_path", "root_entry_sha256",
         "engine_sha256", "archive_sha256", "bootstrap_meta", "host_mnt_ns", "stage_script_sha256",
         "bootstrap_sha256", "host_net_ns", "host_snapshots", "input_sha256",
     }, "META_INVALID")
-    if obj["schema_version"] != 1 or obj["run_dir"] != run_dir or obj["run_name"] != os.path.basename(run_dir):
+    if (obj["schema_version"] != 1 or obj["run_dir"] != run_dir or
+            obj["run_name"] != os.path.basename(run_dir) or
+            obj["terminal_dir"] != _terminal_dir_for(obj["run_name"])):
         fail("META_INVALID")
     if _file_sha256(os.path.join(run_dir, "stage-window.py")) != obj["stage_script_sha256"]:
         fail("STAGE_SCRIPT_HASH")
     return obj
+
+
+def _check_active_meta(active, meta, verb):
+    for key in ("run_dir", "run_name", "terminal_dir", "source_checkout", "source_commit", "deadline",
+                "sudoers_path", "sudoers_sha256", "operator_uid", "stage_script_sha256",
+                "root_entry_path", "root_entry_sha256"):
+        active_key = "stage_script_sha256" if key == "stage_script_sha256" else key
+        if active.get(active_key) != meta.get(key):
+            fail("ACTIVE_META_BINDING")
+    if verb in ("close", "readback", "abort"):
+        _require_root_entry(verb, meta["root_entry_path"], meta["root_entry_sha256"])
+
+
+def _abort_record_paths(run_dir):
+    run_name = os.path.basename(run_dir)
+    if not RUN_NAME.fullmatch(run_name) or run_dir != os.path.join(RUN_BASE, run_name):
+        fail("ABORT_PATH_POLICY")
+    return {
+        "intent": os.path.join(run_dir, "abort.intent.json"),
+        "revoked": os.path.join(run_dir, "abort.revoked.json"),
+        "receipt": os.path.join(RUN_BASE, run_name + ".aborted.json"),
+    }
+
+
+def _is_aborting(run_dir):
+    paths = _abort_record_paths(run_dir)
+    if any(os.path.lexists(path) for path in paths.values()):
+        return True
+    if not os.path.lexists(ACTIVE):
+        return False
+    try:
+        active = _active_read()
+        if active["run_dir"] != run_dir or not os.path.lexists(active["terminal_dir"]):
+            return False
+        record, _ = _terminal_read(active["terminal_dir"])
+        return record["phase"] != "RUNNING"
+    except Exception:
+        # An unreadable terminal journal must block seat entry.
+        return True
+
+
+def _reject_aborting(run_dir):
+    if _is_aborting(run_dir):
+        fail("WINDOW_ABORTING")
+
+
+TERMINAL_KEYS = {
+    "schema_version", "run_name", "run_dir", "terminal_dir", "operation", "state",
+    "phase", "revision", "source_checkout", "source_commit", "operator_uid", "deadline",
+    "stage_script_sha256", "root_entry_path", "root_entry_sha256", "sudoers_path",
+    "sudoers_sha256", "active_sha256", "meta_sha256", "bootstrap_sha256", "host_snapshots",
+    "host_mnt_ns", "host_net_ns", "field_completed", "review_completed",
+}
+
+
+def _terminal_dir_for(run_name):
+    if not RUN_NAME.fullmatch(run_name):
+        fail("TERMINAL_RUN_NAME")
+    return os.path.join(TERMINAL_BASE, run_name + ".journal")
+
+
+def _terminal_complete_path(run_name):
+    if not RUN_NAME.fullmatch(run_name):
+        fail("TERMINAL_RUN_NAME")
+    return os.path.join(TERMINAL_BASE, run_name + ".complete.json")
+
+
+def _terminal_base(create=False):
+    try:
+        st = os.lstat(TERMINAL_BASE)
+    except FileNotFoundError:
+        if not create:
+            return None
+        os.mkdir(TERMINAL_BASE, 0o700)
+        os.chown(TERMINAL_BASE, TERMINAL_UID, TERMINAL_GID)
+        os.chmod(TERMINAL_BASE, 0o700)
+        st = os.lstat(TERMINAL_BASE)
+    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != TERMINAL_UID or
+            st.st_gid != TERMINAL_GID or stat.S_IMODE(st.st_mode) != 0o700 or
+            os.path.realpath(TERMINAL_BASE) != TERMINAL_BASE):
+        fail("TERMINAL_BASE_UNSAFE")
+    return st
+
+
+def _terminal_preflight():
+    if _terminal_base(create=False) is None:
+        return
+    for name in os.listdir(TERMINAL_BASE):
+        if TERMINAL_NAME.fullmatch(name):
+            terminal_dir = os.path.join(TERMINAL_BASE, name)
+            record, _ = _terminal_read(terminal_dir)
+            if record["phase"] != "READBACK_DONE":
+                fail("TERMINAL_PENDING")
+            continue
+        if TERMINAL_COMPLETE_NAME.fullmatch(name):
+            raw, _ = _read_regular(os.path.join(TERMINAL_BASE, name), 0, 0o400, 16384)
+            record = _json_exact(raw, TERMINAL_KEYS, "TERMINAL_COMPLETE_INVALID")
+            run_name = name[:-len(".complete.json")]
+            if (record.get("run_name") != run_name or record.get("phase") != "COMPLETE" or
+                    record.get("state") != "COMPLETE"):
+                fail("TERMINAL_COMPLETE_INVALID")
+            _terminal_validate_record(record, record.get("terminal_dir"))
+            continue
+        fail("TERMINAL_ENTRY_SET")
+
+
+def _terminal_validate_record(record, terminal_dir):
+    if not isinstance(record, dict) or set(record) != TERMINAL_KEYS:
+        fail("TERMINAL_SCHEMA")
+    run_name = record.get("run_name")
+    run_dir = os.path.join(RUN_BASE, run_name) if isinstance(run_name, str) else ""
+    if (type(record.get("schema_version")) is not int or record["schema_version"] != 1 or
+            not isinstance(run_name, str) or not RUN_NAME.fullmatch(run_name) or
+            record.get("run_dir") != run_dir or record.get("terminal_dir") != _terminal_dir_for(run_name) or
+            terminal_dir != record["terminal_dir"] or
+            record.get("operation") not in ("running", "close", "abort", "expire") or
+            record.get("state") not in ("RUNNING", "CLOSING", "ABORTING", "EXPIRING", "COMPLETE") or
+            record.get("phase") not in TERMINAL_PHASES or
+            type(record.get("revision")) is not int or record["revision"] < 0 or
+            not isinstance(record.get("source_checkout"), str) or not SOURCE_PATH.fullmatch(record["source_checkout"]) or
+            not isinstance(record.get("source_commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", record["source_commit"]) or
+            type(record.get("operator_uid")) is not int or record["operator_uid"] <= 0 or
+            type(record.get("deadline")) is not int or record["deadline"] <= 0 or
+            not isinstance(record.get("stage_script_sha256"), str) or not HEX64.fullmatch(record["stage_script_sha256"]) or
+            not isinstance(record.get("root_entry_path"), str) or not ROOT_ENTRY_PATH.fullmatch(record["root_entry_path"]) or
+            not isinstance(record.get("root_entry_sha256"), str) or not HEX64.fullmatch(record["root_entry_sha256"]) or
+            record.get("sudoers_path") != os.path.join(SUDOERS_DIR, run_name) or
+            not isinstance(record.get("sudoers_sha256"), str) or not HEX64.fullmatch(record["sudoers_sha256"]) or
+            not isinstance(record.get("active_sha256"), str) or not HEX64.fullmatch(record["active_sha256"]) or
+            not isinstance(record.get("meta_sha256"), str) or not HEX64.fullmatch(record["meta_sha256"]) or
+            not isinstance(record.get("bootstrap_sha256"), str) or not HEX64.fullmatch(record["bootstrap_sha256"]) or
+            not isinstance(record.get("host_snapshots"), dict) or
+            set(record["host_snapshots"]) != {"/usr/local/sbin", "/etc/sudoers.d", "/run/systemd", "/run/dbus"} or
+            any(not isinstance(v, str) or not HEX64.fullmatch(v) for v in record["host_snapshots"].values()) or
+            not isinstance(record.get("host_mnt_ns"), str) or not re.fullmatch(r"mnt:\[[0-9]+\]", record["host_mnt_ns"]) or
+            not isinstance(record.get("host_net_ns"), str) or not re.fullmatch(r"net:\[[0-9]+\]", record["host_net_ns"]) or
+            type(record.get("field_completed")) is not bool or type(record.get("review_completed")) is not bool):
+        fail("TERMINAL_SCHEMA")
+    if record["phase"] == "RUNNING" and (record["state"] != "RUNNING" or record["operation"] != "running"):
+        fail("TERMINAL_STATE")
+    if record["phase"] != "RUNNING" and (record["state"] == "RUNNING" or record["operation"] == "running"):
+        fail("TERMINAL_STATE")
+    expected_state = {"close": "CLOSING", "abort": "ABORTING", "expire": "EXPIRING"}
+    if record["state"] != "COMPLETE" and record["phase"] != "RUNNING" and record["state"] != expected_state.get(record["operation"]):
+        fail("TERMINAL_STATE")
+    if (record["phase"] in ("COMPLETE", "READBACK_DONE")) != (record["state"] == "COMPLETE"):
+        fail("TERMINAL_STATE")
+    return record
+
+
+def _terminal_read(terminal_dir):
+    _terminal_base(create=False)
+    if terminal_dir != os.path.realpath(terminal_dir) or not TERMINAL_NAME.fullmatch(os.path.basename(terminal_dir)):
+        fail("TERMINAL_PATH")
+    st = os.lstat(terminal_dir)
+    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != TERMINAL_UID or
+            st.st_gid != TERMINAL_GID or stat.S_IMODE(st.st_mode) != 0o700):
+        fail("TERMINAL_DIRECTORY")
+    names = set(os.listdir(terminal_dir))
+    if names not in ({"control.lock", "controller.py", "journal.json"},
+                     {"control.lock", "controller.py", "journal.json", "journal.next"}):
+        fail("TERMINAL_ENTRY_SET")
+    lock_stat = os.lstat(os.path.join(terminal_dir, "control.lock"))
+    if (not stat.S_ISREG(lock_stat.st_mode) or stat.S_ISLNK(lock_stat.st_mode) or
+            lock_stat.st_uid != TERMINAL_UID or lock_stat.st_gid != TERMINAL_GID or
+            stat.S_IMODE(lock_stat.st_mode) != 0o600 or lock_stat.st_nlink != 1):
+        fail("TERMINAL_LOCK_UNSAFE")
+    journal_path = os.path.join(terminal_dir, "journal.json")
+    raw, _ = _read_regular(journal_path, 0, 0o600, 16384)
+    record = _json_exact(raw, TERMINAL_KEYS, "TERMINAL_SCHEMA")
+    _terminal_validate_record(record, terminal_dir)
+    next_path = os.path.join(terminal_dir, "journal.next")
+    if os.path.lexists(next_path):
+        next_raw, _ = _read_regular(next_path, 0, 0o600, 16384)
+        candidate = _json_exact(next_raw, TERMINAL_KEYS, "TERMINAL_SCHEMA")
+        _terminal_validate_record(candidate, terminal_dir)
+        _terminal_check_transition(record, candidate)
+        dfd = os.open(terminal_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.replace("journal.next", "journal.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+            os.fsync(dfd)
+        except OSError:
+            fail("TERMINAL_RECOVER_COMMIT")
+        finally:
+            os.close(dfd)
+        record, raw = candidate, next_raw
+    controller = os.path.join(terminal_dir, "controller.py")
+    controller_raw, _ = _read_regular(controller, 0, 0o500, MAX_HELPER_OUTPUT)
+    if hashlib.sha256(controller_raw).hexdigest() != record["stage_script_sha256"]:
+        fail("TERMINAL_CONTROLLER_HASH")
+    return record, raw
+
+
+def _terminal_next(record, *, phase=None, operation=None, state=None, **updates):
+    current_index = TERMINAL_PHASES.index(record["phase"])
+    next_phase = phase or TERMINAL_PHASES[current_index + 1] if current_index + 1 < len(TERMINAL_PHASES) else None
+    if next_phase is None or next_phase not in TERMINAL_PHASES or TERMINAL_PHASES.index(next_phase) != current_index + 1:
+        fail("TERMINAL_TRANSITION")
+    updated = dict(record)
+    updated.update(updates)
+    updated["phase"] = next_phase
+    updated["revision"] = record["revision"] + 1
+    if operation is not None:
+        updated["operation"] = operation
+    if state is not None:
+        updated["state"] = state
+    _terminal_validate_record(updated, record["terminal_dir"])
+    _terminal_check_transition(record, updated)
+    return updated
+
+
+def _terminal_check_transition(old, new):
+    mutable = {"operation", "state", "phase", "revision", "field_completed", "review_completed"}
+    if any(old[key] != new[key] for key in TERMINAL_KEYS - mutable):
+        fail("TERMINAL_BINDING")
+    if (new["revision"] != old["revision"] + 1 or
+            TERMINAL_PHASES.index(new["phase"]) != TERMINAL_PHASES.index(old["phase"]) + 1):
+        fail("TERMINAL_TRANSITION")
+    if old["phase"] == "RUNNING":
+        if (new["phase"] != "INTENT" or new["operation"] not in ("close", "abort", "expire") or
+                new["state"] != {"close": "CLOSING", "abort": "ABORTING", "expire": "EXPIRING"}[new["operation"]]):
+            fail("TERMINAL_TRANSITION")
+    elif old["phase"] == "READBACK_DONE" or new["operation"] != old["operation"]:
+        fail("TERMINAL_TRANSITION")
+    elif old["phase"] == "COMPLETE":
+        if new["phase"] != "READBACK_DONE" or new["state"] != "COMPLETE":
+            fail("TERMINAL_TRANSITION")
+    elif new["phase"] == "COMPLETE":
+        if new["state"] != "COMPLETE":
+            fail("TERMINAL_TRANSITION")
+    elif new["state"] != old["state"]:
+        fail("TERMINAL_TRANSITION")
+
+
+def _terminal_store(terminal_dir, old_record, next_record):
+    _terminal_validate_record(old_record, terminal_dir)
+    _terminal_validate_record(next_record, terminal_dir)
+    _terminal_check_transition(old_record, next_record)
+    journal = os.path.join(terminal_dir, "journal.json")
+    temp = os.path.join(terminal_dir, "journal.next")
+    raw = (json.dumps(next_record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if os.path.lexists(temp):
+        existing, _ = _read_regular(temp, 0, 0o600, 16384)
+        if existing != raw:
+            fail("TERMINAL_TEMP_DRIFT")
+    else:
+        _write_new(temp, raw, 0o600)
+    dfd = os.open(terminal_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.replace("journal.next", "journal.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+    except OSError:
+        fail("TERMINAL_COMMIT_FAILED")
+    finally:
+        os.close(dfd)
+    saved, _ = _read_regular(journal, 0, 0o600, 16384)
+    if saved != raw:
+        fail("TERMINAL_COMMIT_READBACK")
+    return next_record
+
+
+def _terminal_create(active, meta, active_sha, meta_sha):
+    base_was_absent = not os.path.lexists(TERMINAL_BASE)
+    base_stat = _terminal_base(create=True)
+    _terminal_preflight()
+    terminal_dir = _terminal_dir_for(active["run_name"])
+    if os.path.lexists(terminal_dir) or os.path.lexists(_terminal_complete_path(active["run_name"])):
+        fail("TERMINAL_RUN_COLLISION")
+    os.mkdir(terminal_dir, 0o700)
+    directory_st = os.lstat(terminal_dir)
+    directory_identity = (directory_st.st_dev, directory_st.st_ino)
+    created_files = {}
+
+    def record_created(path, stage, identity, digest, mode):
+        if os.path.dirname(path) != terminal_dir or os.path.basename(path) not in {
+                "control.lock", "controller.py", "journal.json"}:
+            fail("TERMINAL_CREATE_PATH")
+        name = os.path.basename(path)
+        previous = created_files.get(name)
+        inode = identity[:2]
+        if previous is not None and previous["inode"] != inode:
+            fail("TERMINAL_CREATE_DRIFT")
+        if stage == "written":
+            created_files[name] = {"inode": inode, "sha256": digest, "mode": mode, "complete": True}
+        elif previous is None:
+            created_files[name] = {"inode": inode, "sha256": digest, "mode": mode, "complete": False}
+
+    try:
+        os.chown(terminal_dir, TERMINAL_UID, TERMINAL_GID)
+        os.chmod(terminal_dir, 0o700)
+        _write_new(os.path.join(terminal_dir, "control.lock"), b"", 0o600,
+                   created=record_created)
+        _write_new_from_file(SCRIPT, os.path.join(terminal_dir, "controller.py"),
+                             meta["stage_script_sha256"], 0o500, created=record_created)
+        record = {
+            "schema_version": 1, "run_name": active["run_name"], "run_dir": active["run_dir"],
+            "terminal_dir": terminal_dir, "operation": "running", "state": "RUNNING",
+            "phase": "RUNNING", "revision": 0,
+            "source_checkout": meta["source_checkout"], "source_commit": meta["source_commit"],
+            "operator_uid": meta["operator_uid"], "deadline": meta["deadline"],
+            "stage_script_sha256": meta["stage_script_sha256"],
+            "root_entry_path": meta["root_entry_path"], "root_entry_sha256": meta["root_entry_sha256"],
+            "sudoers_path": active["sudoers_path"], "sudoers_sha256": active["sudoers_sha256"],
+            "active_sha256": active_sha, "meta_sha256": meta_sha,
+            "bootstrap_sha256": meta["bootstrap_sha256"], "host_snapshots": meta["host_snapshots"],
+            "host_mnt_ns": meta["host_mnt_ns"], "host_net_ns": meta["host_net_ns"],
+            "field_completed": False, "review_completed": False,
+        }
+        _terminal_validate_record(record, terminal_dir)
+        raw = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        _write_new(os.path.join(terminal_dir, "journal.json"), raw, 0o600,
+                   created=record_created)
+        check, _ = _terminal_read(terminal_dir)
+        if check != record:
+            fail("TERMINAL_INIT_READBACK")
+        return terminal_dir
+    except BaseException:
+        _best_effort_remove_terminal_creation(terminal_dir, active["run_name"],
+                                              directory_identity, created_files)
+        if base_was_absent:
+            _best_effort_remove_empty_terminal_base(base_stat)
+        raise
+
+
+def _best_effort_remove_terminal_creation(terminal_dir, run_name, directory_identity, created_files):
+    """Remove only nodes opened by this failed journal creation, by directory FD."""
+    if terminal_dir != _terminal_dir_for(run_name):
+        return False
+    basefd = None
+    dfd = None
+    try:
+        basefd = os.open(TERMINAL_BASE, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        base_st = os.fstat(basefd)
+        if (base_st.st_uid != TERMINAL_UID or base_st.st_gid != TERMINAL_GID or
+                stat.S_IMODE(base_st.st_mode) != 0o700):
+            return False
+        name = os.path.basename(terminal_dir)
+        current_dir = os.stat(name, dir_fd=basefd, follow_symlinks=False)
+        if (not stat.S_ISDIR(current_dir.st_mode) or stat.S_ISLNK(current_dir.st_mode) or
+                (current_dir.st_dev, current_dir.st_ino) != directory_identity or
+                current_dir.st_uid != TERMINAL_UID or current_dir.st_gid != TERMINAL_GID or
+                stat.S_IMODE(current_dir.st_mode) != 0o700):
+            return False
+        dfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      dir_fd=basefd)
+        opened_dir = os.fstat(dfd)
+        if (opened_dir.st_dev, opened_dir.st_ino) != directory_identity:
+            return False
+        entries = set(os.listdir(dfd))
+        if not entries <= set(created_files):
+            return False
+        for entry in sorted(entries):
+            pin = created_files.get(entry)
+            if pin is None:
+                return False
+            before = os.stat(entry, dir_fd=dfd, follow_symlinks=False)
+            if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or
+                    (before.st_dev, before.st_ino) != pin["inode"] or
+                    before.st_uid != TERMINAL_UID or before.st_gid != TERMINAL_GID or
+                    stat.S_IMODE(before.st_mode) != pin["mode"] or before.st_nlink != 1):
+                return False
+            fd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         dir_fd=dfd)
+            try:
+                opened = os.fstat(fd)
+                if ((opened.st_dev, opened.st_ino) != pin["inode"] or
+                        not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
+                    return False
+                if pin["complete"]:
+                    digest = hashlib.sha256(_read_fd_all(fd, MAX_HELPER_OUTPUT)).hexdigest()
+                    if digest != pin["sha256"]:
+                        return False
+            finally:
+                os.close(fd)
+            os.unlink(entry, dir_fd=dfd)
+        os.fsync(dfd)
+        os.close(dfd)
+        dfd = None
+        os.rmdir(name, dir_fd=basefd)
+        os.fsync(basefd)
+        return True
+    except Exception:
+        return False
+    finally:
+        if dfd is not None:
+            os.close(dfd)
+        if basefd is not None:
+            os.close(basefd)
+
+
+def _best_effort_remove_empty_terminal_base(expected_stat):
+    parentfd = None
+    try:
+        parent = os.path.dirname(TERMINAL_BASE)
+        name = os.path.basename(TERMINAL_BASE)
+        parentfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        current = os.stat(name, dir_fd=parentfd, follow_symlinks=False)
+        if ((current.st_dev, current.st_ino) != (expected_stat.st_dev, expected_stat.st_ino) or
+                not stat.S_ISDIR(current.st_mode) or current.st_uid != TERMINAL_UID or
+                current.st_gid != TERMINAL_GID or stat.S_IMODE(current.st_mode) != 0o700):
+            return False
+        dfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      dir_fd=parentfd)
+        try:
+            if os.listdir(dfd):
+                return False
+        finally:
+            os.close(dfd)
+        os.rmdir(name, dir_fd=parentfd)
+        os.fsync(parentfd)
+        return True
+    except Exception:
+        return False
+    finally:
+        if parentfd is not None:
+            os.close(parentfd)
+
+
+def _read_fd_all(fd, limit):
+    chunks, total = [], 0
+    while True:
+        block = os.read(fd, 4096)
+        if not block:
+            return b"".join(chunks)
+        total += len(block)
+        if total > limit:
+            fail("TERMINAL_CREATE_SIZE")
+        chunks.append(block)
+
+
+def _best_effort_remove_terminal(terminal_dir, run_name):
+    """Remove only an incomplete prepare journal whose exact binding is known."""
+    try:
+        if terminal_dir != _terminal_dir_for(run_name) or not os.path.lexists(terminal_dir):
+            return
+        record, _ = _terminal_read(terminal_dir)
+        if record["run_name"] != run_name or record["phase"] != "RUNNING":
+            return
+        allowed = {"control.lock", "controller.py", "journal.json"}
+        if set(os.listdir(terminal_dir)) != allowed:
+            return
+        for name in allowed:
+            st = os.lstat(os.path.join(terminal_dir, name))
+            if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or st.st_nlink != 1:
+                return
+        shutil.rmtree(terminal_dir)
+        if os.path.lexists(terminal_dir):
+            return
+        if not os.listdir(TERMINAL_BASE):
+            os.rmdir(TERMINAL_BASE)
+    except Exception:
+        # A failed cleanup leaves a pending journal; prepare will fail closed.
+        return
+
+
+def _terminal_lock(terminal_dir):
+    path = os.path.join(terminal_dir, "control.lock")
+    st = os.lstat(path)
+    if (not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or
+            st.st_gid != 0 or stat.S_IMODE(st.st_mode) != 0o600 or st.st_nlink != 1):
+        fail("TERMINAL_LOCK_UNSAFE")
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    if _meta(st) != _meta(os.fstat(fd)):
+        os.close(fd)
+        fail("TERMINAL_LOCK_DRIFT")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _terminal_advance(terminal_dir, *, phase=None, operation=None, state=None, **updates):
+    record, _ = _terminal_read(terminal_dir)
+    updated = _terminal_next(record, phase=phase, operation=operation, state=state, **updates)
+    return _terminal_store(terminal_dir, record, updated)
+
+
+def _terminal_active(record):
+    return {
+        "run_name": record["run_name"], "run_dir": record["run_dir"],
+        "terminal_dir": record["terminal_dir"], "deadline": record["deadline"],
+        "sudoers_path": record["sudoers_path"], "sudoers_sha256": record["sudoers_sha256"],
+        "source_checkout": record["source_checkout"], "source_commit": record["source_commit"],
+        "stage_script_sha256": record["stage_script_sha256"],
+        "operator_uid": record["operator_uid"], "root_entry_path": record["root_entry_path"],
+        "root_entry_sha256": record["root_entry_sha256"],
+    }
+
+
+def _terminal_meta(record):
+    return {
+        "run_name": record["run_name"], "run_dir": record["run_dir"],
+        "source_checkout": record["source_checkout"], "source_commit": record["source_commit"],
+        "operator_uid": record["operator_uid"], "deadline": record["deadline"],
+        "stage_script_sha256": record["stage_script_sha256"],
+        "root_entry_path": record["root_entry_path"], "root_entry_sha256": record["root_entry_sha256"],
+        "host_snapshots": record["host_snapshots"],
+    }
+
+
+def _terminal_phase(terminal_dir, expected):
+    record, _ = _terminal_read(terminal_dir)
+    if record["phase"] != expected:
+        fail("TERMINAL_PHASE_MISMATCH")
+    return record
+
+
+def _terminal_advance_if(terminal_dir, phase, **kwargs):
+    record, _ = _terminal_read(terminal_dir)
+    if record["phase"] != phase:
+        fail("TERMINAL_PHASE_MISMATCH")
+    return _terminal_advance(terminal_dir, **kwargs)
+
+
+def _terminal_finish(terminal_dir, operation=None, field_complete=None, review_complete=None):
+    """Resume a journaled close/abort/expiry; each destructive step has intent and done states."""
+    lockfd = _terminal_lock(terminal_dir)
+    try:
+        record, _ = _terminal_read(terminal_dir)
+        if record["phase"] == "RUNNING":
+            if operation not in ("close", "abort", "expire"):
+                fail("TERMINAL_OPERATION_REQUIRED")
+            if operation == "close" and not (field_complete and review_complete):
+                fail("SEATS_INCOMPLETE")
+            field_value = bool(field_complete)
+            review_value = bool(review_complete)
+            record = _terminal_advance(
+                terminal_dir, operation=operation,
+                state={"close": "CLOSING", "abort": "ABORTING", "expire": "EXPIRING"}[operation],
+                field_completed=field_value, review_completed=review_value)
+            record = _terminal_advance(terminal_dir, phase="RULE_INTENT")
+        elif operation is not None and record["operation"] != operation:
+            fail("TERMINAL_OPERATION_MISMATCH")
+
+        active = _terminal_active(record)
+        meta = _terminal_meta(record)
+        phase = record["phase"]
+
+        if phase == "RULE_INTENT":
+            _sudoers_remove(active)
+            if os.path.lexists(active["sudoers_path"]):
+                fail("TERMINAL_RULE_NOT_REVOKED")
+            _sudoers_global_check()
+            record = _terminal_advance(terminal_dir, phase="RULE_DONE")
+            phase = record["phase"]
+        if phase == "RULE_DONE":
+            record = _terminal_advance(terminal_dir, phase="WATCHDOG_INTENT")
+            phase = record["phase"]
+        if phase == "WATCHDOG_INTENT":
+            if os.path.isdir(record["run_dir"]) and os.path.lexists(os.path.join(record["run_dir"], "watchdog.pid")):
+                _stop_watchdog(record["run_dir"], allow_absent=False)
+            record = _terminal_advance(terminal_dir, phase="WATCHDOG_DONE")
+            phase = record["phase"]
+        if phase == "WATCHDOG_DONE":
+            if os.path.isdir(record["run_dir"]):
+                _assert_no_window_processes(record["run_dir"], os.getpid())
+                if _mounts_for_run(record["run_dir"]):
+                    fail("TERMINAL_MOUNT_ACTIVE")
+            record = _terminal_advance(terminal_dir, phase="QUIESCENCE_DONE")
+            phase = record["phase"]
+        if phase == "QUIESCENCE_DONE":
+            record = _terminal_advance(terminal_dir, phase="BOOTSTRAP_INTENT")
+            phase = record["phase"]
+        if phase == "BOOTSTRAP_INTENT":
+            if os.path.lexists(BOOTSTRAP):
+                raw, _ = _read_regular(BOOTSTRAP, 0, 0o600, 65536)
+                if hashlib.sha256(raw).hexdigest() != record["bootstrap_sha256"]:
+                    fail("BOOTSTRAP_DRIFT")
+                os.unlink(BOOTSTRAP)
+            record = _terminal_advance(terminal_dir, phase="BOOTSTRAP_DONE")
+            phase = record["phase"]
+        if phase == "BOOTSTRAP_DONE":
+            record = _terminal_advance(terminal_dir, phase="ACTIVE_INTENT")
+            phase = record["phase"]
+        if phase == "ACTIVE_INTENT":
+            if os.path.lexists(ACTIVE):
+                raw, _ = _read_regular(ACTIVE, 0, 0o600, 8192)
+                if hashlib.sha256(raw).hexdigest() != record["active_sha256"]:
+                    fail("ACTIVE_DRIFT")
+                os.unlink(ACTIVE)
+            record = _terminal_advance(terminal_dir, phase="ACTIVE_DONE")
+            phase = record["phase"]
+        if phase == "ACTIVE_DONE":
+            record = _terminal_advance(terminal_dir, phase="RUN_VERIFY")
+            phase = record["phase"]
+        if phase == "RUN_VERIFY":
+            if not os.path.lexists(record["run_dir"]):
+                fail("TERMINAL_RUN_MISSING_BEFORE_INTENT")
+            _check_run_tree(record["run_dir"], allow_incomplete=(record["operation"] != "close"))
+            record = _terminal_advance(terminal_dir, phase="RUN_INTENT")
+            phase = record["phase"]
+        if phase == "RUN_INTENT":
+            if os.path.lexists(record["run_dir"]):
+                _safe_remove_tree(record["run_dir"], record["run_name"],
+                                  allow_incomplete=(record["operation"] != "close"), allow_partial=True)
+            record = _terminal_advance(terminal_dir, phase="RUN_DONE")
+            phase = record["phase"]
+        if phase == "RUN_DONE":
+            record = _terminal_advance(terminal_dir, phase="CHECKOUT_VERIFY")
+            phase = record["phase"]
+        if phase == "CHECKOUT_VERIFY":
+            if not os.path.lexists(record["source_checkout"]):
+                fail("TERMINAL_CHECKOUT_MISSING_BEFORE_INTENT")
+            _validate_checkout_for_cleanup(record["source_checkout"], record["source_commit"], record["operator_uid"])
+            record = _terminal_advance(terminal_dir, phase="CHECKOUT_VERIFIED")
+            phase = record["phase"]
+        if phase == "CHECKOUT_VERIFIED":
+            record = _terminal_advance(terminal_dir, phase="CHECKOUT_INTENT")
+            phase = record["phase"]
+        if phase == "CHECKOUT_INTENT":
+            if os.path.lexists(record["source_checkout"]):
+                _remove_checkout(record["source_checkout"], record["source_commit"], record["operator_uid"],
+                                 allow_partial=True)
+            record = _terminal_advance(terminal_dir, phase="CHECKOUT_DONE")
+            phase = record["phase"]
+        if phase == "CHECKOUT_DONE":
+            if (os.path.lexists(ACTIVE) or os.path.lexists(BOOTSTRAP) or
+                    os.path.lexists(record["sudoers_path"]) or os.path.lexists("/etc/lab-fixture-digest") or
+                    _host_snapshots() != record["host_snapshots"]):
+                fail("TERMINAL_HOST_POSTCHECK")
+            _sudoers_global_check()
+            record = _terminal_advance(terminal_dir, phase="POSTCHECK_PASS")
+            phase = record["phase"]
+        if phase == "POSTCHECK_PASS":
+            record = _terminal_advance(terminal_dir, phase="COMPLETE", state="COMPLETE")
+            _terminal_publish_complete(terminal_dir, record)
+            record, _ = _terminal_read(terminal_dir)
+        elif phase == "COMPLETE":
+            _terminal_publish_complete(terminal_dir, record)
+            record, _ = _terminal_read(terminal_dir)
+        status = "COMPLETE" if record["field_completed"] and record["review_completed"] else "INCOMPLETE"
+        print("STATUS=TERMINAL_CLEANUP_" + status)
+        print("RUN=" + record["run_name"])
+        print("READBACK=REQUIRED")
+        return 0 if status == "COMPLETE" or record["operation"] != "close" else 3
+    finally:
+        os.close(lockfd)
+
+
+def _terminal_read_complete(run_name):
+    record, raw = _terminal_read(_terminal_dir_for(run_name))
+    if record["run_name"] != run_name or record["phase"] not in ("COMPLETE", "READBACK_DONE"):
+        fail("TERMINAL_COMPLETE_INVALID")
+    return record, raw
+
+
+def _terminal_publish_complete(terminal_dir, record):
+    if record["phase"] != "COMPLETE" or record["state"] != "COMPLETE":
+        fail("TERMINAL_COMPLETE_INVALID")
+    verified, _ = _terminal_read(terminal_dir)
+    if verified != record:
+        fail("TERMINAL_COMPLETE_READBACK")
+
+
+def _process_starttime(pid):
+    try:
+        with open("/proc/" + str(pid) + "/stat", "rt", encoding="ascii") as stream:
+            row = stream.read(4096)
+        fields = row.rsplit(")", 1)[1].strip().split()
+        if len(fields) < 20:
+            fail("PROCESS_IDENTITY")
+        return int(fields[19])
+    except Refusal:
+        raise
+    except Exception:
+        fail("PROCESS_IDENTITY")
+
+
+def _terminate_child_pidfd(process, expected_starttime):
+    _require_pidfd_support()
+    try:
+        pidfd = os.pidfd_open(process.pid, 0)
+    except ProcessLookupError:
+        return "ALREADY_EXITED"
+    except OSError:
+        fail("ENTRY_STOP_IDENTITY_UNAVAILABLE")
+    try:
+        if _process_starttime(process.pid) != expected_starttime:
+            fail("ENTRY_STOP_IDENTITY_MISMATCH")
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        if poller.poll(0):
+            return "ALREADY_EXITED"
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            return "ALREADY_EXITED"
+        except OSError:
+            fail("ENTRY_STOP_FAILED")
+        if not poller.poll(2000):
+            fail("ENTRY_STOP_FAILED")
+        return "STOPPED"
+    finally:
+        os.close(pidfd)
 
 
 def _mount(args):
@@ -912,7 +1746,33 @@ def _inner(role):
     if role not in ("field", "review"):
         fail("ENTRY_ROLE")
     run_dir = os.path.dirname(os.path.realpath(__file__))
-    meta = _load_meta(run_dir)
+    lockfd = _locked(run_dir)
+    try:
+        active = _active_read()
+        meta = _load_meta(run_dir)
+        _check_active_meta(active, meta, "inner")
+        _reject_aborting(run_dir)
+        started_path = os.path.join(run_dir, "seat." + role)
+        started, _ = _read_regular(started_path, 0, 0o600, 64)
+        if started != b"started\n":
+            fail("SEAT_START_MISSING")
+        entry_raw, _ = _read_regular(os.path.join(run_dir, "entry." + role + ".json"), 0, 0o600, 1024)
+        entry = _json_exact(entry_raw, {"role", "entry_pid", "entry_starttime", "requested_utc", "state"},
+                            "SEAT_ENTRY_RECORD")
+        if (entry["role"] != role or entry["state"] != "launching" or
+                type(entry["entry_pid"]) is not int or entry["entry_pid"] != os.getppid() or
+                type(entry["entry_starttime"]) is not int or
+                _process_starttime(entry["entry_pid"]) != entry["entry_starttime"]):
+            fail("SEAT_ENTRY_BINDING")
+        entered = os.path.join(run_dir, "seat." + role + ".entered")
+        record = {"role": role, "pid": os.getpid(),
+                  "starttime": _process_starttime(os.getpid()),
+                  "entry_parent_pid": os.getppid(), "entered_utc":
+                      datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        _write_new(entered, json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", 0o600)
+        _reject_aborting(run_dir)
+    finally:
+        os.close(lockfd)
     if int(time.time()) >= meta["deadline"]:
         fail("WINDOW_EXPIRED")
     if os.readlink("/proc/self/ns/mnt") == meta["host_mnt_ns"]:
@@ -1031,16 +1891,27 @@ def _check_anchor_input_hashes(selected, expected):
 
 def _active_read():
     raw, _ = _read_regular(ACTIVE, 0, 0o600, 8192)
-    obj = _json_exact(raw, {"run_dir", "run_name", "source_checkout", "deadline", "sudoers_path", "sudoers_sha256"}, "ACTIVE_INVALID")
+    obj = _json_exact(raw, {"run_dir", "run_name", "terminal_dir", "source_checkout", "deadline", "sudoers_path",
+                            "sudoers_sha256", "source_commit", "stage_script_sha256",
+                            "operator_uid", "root_entry_path", "root_entry_sha256"}, "ACTIVE_INVALID")
     if (not isinstance(obj["run_name"], str) or not RUN_NAME.fullmatch(obj["run_name"]) or
             obj["run_dir"] != os.path.join(RUN_BASE, obj["run_name"]) or
+            obj["terminal_dir"] != _terminal_dir_for(obj["run_name"]) or
             obj["sudoers_path"] != os.path.join(SUDOERS_DIR, obj["run_name"]) or
-            not SOURCE_PATH.fullmatch(obj["source_checkout"])):
+            not SOURCE_PATH.fullmatch(obj["source_checkout"]) or
+            not re.fullmatch(r"[0-9a-f]{40}", obj["source_commit"]) or
+            not isinstance(obj["stage_script_sha256"], str) or not HEX64.fullmatch(obj["stage_script_sha256"]) or
+            type(obj["operator_uid"]) is not int or obj["operator_uid"] <= 0 or
+            not isinstance(obj["root_entry_path"], str) or not ROOT_ENTRY_PATH.fullmatch(obj["root_entry_path"]) or
+            not isinstance(obj["root_entry_sha256"], str) or not HEX64.fullmatch(obj["root_entry_sha256"])):
         fail("ACTIVE_INVALID")
     return obj
 
 
 def _start_watchdog(run_dir, deadline):
+    _require_pidfd_support()
+    probe = os.pidfd_open(os.getpid(), 0)
+    os.close(probe)
     pid = os.fork()
     if pid == 0:
         try:
@@ -1061,16 +1932,109 @@ def _start_watchdog(run_dir, deadline):
             os.execve(argv[0], argv, env)
         except BaseException:
             os._exit(1)
-    ready = os.path.join(run_dir, "watchdog.pid")
-    for _ in range(100):
-        if os.path.exists(ready):
-            return
-        time.sleep(0.01)
     try:
-        os.kill(pid, signal.SIGTERM)
+        pidfd = os.pidfd_open(pid, 0)
+    except ProcessLookupError:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        fail("WATCHDOG_START_FAILED")
     except OSError:
-        pass
-    fail("WATCHDOG_START_FAILED")
+        # No numeric-PID fallback is permitted. The child is private to this
+        # parent; if a pidfd cannot be obtained, leave the deadline watchdog
+        # untouched and refuse to stage.
+        global WATCHDOG_START_UNCERTAIN
+        WATCHDOG_START_UNCERTAIN = True
+        fail("PIDFD_UNAVAILABLE")
+    try:
+        ready = os.path.join(run_dir, "watchdog.pid")
+        for _ in range(100):
+            if os.path.exists(ready):
+                return
+            time.sleep(0.01)
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except OSError:
+            fail("WATCHDOG_STOP_FAILED")
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        if not poller.poll(2000):
+            fail("WATCHDOG_STOP_FAILED")
+        fail("WATCHDOG_START_FAILED")
+    finally:
+        os.close(pidfd)
+
+
+def _require_pidfd_support():
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        fail("PIDFD_UNAVAILABLE")
+
+
+def _proc_command_and_cwd(pid):
+    try:
+        with open("/proc/" + str(pid) + "/cmdline", "rb") as stream:
+            raw = stream.read(8192)
+        cmd = [item for item in raw.split(b"\0") if item]
+        cwd = os.readlink("/proc/" + str(pid) + "/cwd")
+        return cmd, cwd
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        fail("WATCHDOG_IDENTITY_MISMATCH")
+
+
+def _watchdog_record(run_dir):
+    raw, _ = _read_regular(os.path.join(run_dir, "watchdog.pid"), 0, 0o600, 1024)
+    obj = _json_exact(raw, {"pid", "starttime", "cwd", "argv_sha256"}, "WATCHDOG_RECORD_INVALID")
+    expected_cwd = _load_meta(run_dir)["source_checkout"]
+    expected_argv = _watchdog_exec_argv(run_dir)
+    if (type(obj["pid"]) is not int or obj["pid"] <= 0 or
+            type(obj["starttime"]) is not int or obj["starttime"] <= 0 or
+            obj["cwd"] != expected_cwd or obj["argv_sha256"] !=
+            hashlib.sha256("\0".join(expected_argv).encode("utf-8")).hexdigest()):
+        fail("WATCHDOG_RECORD_INVALID")
+    return obj
+
+
+def _stop_watchdog(run_dir, allow_absent=False):
+    path = os.path.join(run_dir, "watchdog.pid")
+    if not os.path.lexists(path):
+        if allow_absent:
+            return "ALREADY_ABSENT"
+        fail("WATCHDOG_RECORD_MISSING")
+    _require_pidfd_support()
+    record = _watchdog_record(run_dir)
+    try:
+        pidfd = os.pidfd_open(record["pid"], 0)
+    except ProcessLookupError:
+        return "ALREADY_EXITED"
+    except OSError:
+        fail("PIDFD_UNAVAILABLE")
+    try:
+        current_start = _process_starttime(record["pid"])
+        cmd, cwd = _proc_command_and_cwd(record["pid"])
+        if (current_start != record["starttime"] or cmd is None or cwd != record["cwd"] or
+                not _watchdog_identity_matches(cmd, cwd, run_dir, record["cwd"]) or
+                hashlib.sha256(b"\0".join(cmd)).hexdigest() != record["argv_sha256"]):
+            fail("WATCHDOG_IDENTITY_MISMATCH")
+        if _process_starttime(record["pid"]) != record["starttime"]:
+            fail("WATCHDOG_IDENTITY_MISMATCH")
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        if poller.poll(0):
+            return "ALREADY_EXITED"
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            return "ALREADY_EXITED"
+        except OSError:
+            fail("WATCHDOG_STOP_FAILED")
+        if not poller.poll(2000):
+            fail("WATCHDOG_STOP_FAILED")
+        return "STOPPED"
+    finally:
+        os.close(pidfd)
 
 
 def _sudoers_remove(active):
@@ -1101,26 +2065,57 @@ def _sudoers_remove(active):
 
 
 def _locked(run_dir):
-    lockfd = os.open(os.path.join(run_dir, "control.lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    path = os.path.join(run_dir, "control.lock")
+    st = os.lstat(path)
+    if (not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or
+            st.st_gid != 0 or stat.S_IMODE(st.st_mode) != 0o600 or st.st_nlink != 1):
+        fail("CONTROL_LOCK_UNSAFE")
+    lockfd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    if _meta(st) != _meta(os.fstat(lockfd)):
+        os.close(lockfd)
+        fail("CONTROL_LOCK_DRIFT")
     fcntl.flock(lockfd, fcntl.LOCK_EX)
     return lockfd
 
 
 def _expire_window():
     _check_root()
-    active = _active_read()
-    lockfd = _locked(active["run_dir"])
+    observed = _active_read()
+    run_dir = observed["run_dir"]
+    lockfd = _locked(run_dir)
+    terminal_fd = None
     try:
-        status = _sudoers_remove(active)
-        receipt = "STATUS=EXPIRED\nSUDOERS=" + status + "\nDEADLINE_EPOCH=" + str(active["deadline"]) + "\n"
-        closed = os.path.join(RUN_BASE, active["run_name"] + ".closed")
-        if not os.path.lexists(closed):
-            _write_new(closed, receipt, 0o600)
+        active, _, _, _ = _active_meta_digests()
+        if active["run_dir"] != run_dir:
+            fail("ACTIVE_CHANGED")
+        meta = _load_meta(run_dir)
+        _check_active_meta(active, meta, "close")
+        if int(time.time()) < meta["deadline"]:
+            fail("WINDOW_NOT_EXPIRED")
+        terminal_fd = _terminal_lock(active["terminal_dir"])
+        record, _ = _terminal_read(active["terminal_dir"])
+        if record["phase"] == "RUNNING":
+            field = _seat_state(run_dir, "field", meta["deadline"], allow_malformed=True)
+            review = _seat_state(run_dir, "review", meta["deadline"], allow_malformed=True)
+            _terminal_advance(active["terminal_dir"], operation="expire", state="EXPIRING",
+                              field_completed=field, review_completed=review)
+            _terminal_advance(active["terminal_dir"], phase="RULE_INTENT")
+            record, _ = _terminal_read(active["terminal_dir"])
+        elif record["operation"] != "expire":
+            fail("TERMINAL_OPERATION_MISMATCH")
+        if record["phase"] == "RULE_INTENT":
+            _sudoers_remove(active)
+            if os.path.lexists(active["sudoers_path"]):
+                fail("TERMINAL_RULE_NOT_REVOKED")
+            _sudoers_global_check()
+            _terminal_advance(active["terminal_dir"], phase="RULE_DONE")
     finally:
+        if terminal_fd is not None:
+            os.close(terminal_fd)
         os.close(lockfd)
 
 
-def _safe_remove_tree(path, expected_name, allow_incomplete=False):
+def _safe_remove_tree(path, expected_name, allow_incomplete=False, allow_partial=False):
     if path != os.path.join(RUN_BASE, expected_name) or not RUN_NAME.fullmatch(expected_name):
         fail("CLEANUP_PATH_POLICY")
     st = os.lstat(path)
@@ -1128,40 +2123,215 @@ def _safe_remove_tree(path, expected_name, allow_incomplete=False):
         fail("CLEANUP_PATH_POLICY")
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
         fail("SAFE_RMTREE_UNAVAILABLE")
-    _check_run_tree(path, allow_incomplete=allow_incomplete)
+    _check_run_tree(path, allow_incomplete=allow_incomplete, allow_partial=allow_partial)
     shutil.rmtree(path)
     if os.path.lexists(path):
         fail("CLEANUP_READBACK_FAILED")
 
 
-def _check_run_tree(path, allow_incomplete=False):
+def _check_run_tree(path, allow_incomplete=False, allow_partial=False):
     required = {"payload", "stage-window.py", "g3.json", "field", "review", "ns", "control.lock", "meta.json", "watchdog.pid"}
-    allowed = required | {"seat.field", "seat.review", "seat.field.done", "seat.review.done"}
+    allowed = required | {
+        "seat.field", "seat.review", "seat.field.done", "seat.review.done",
+        "seat.field.entered", "seat.review.entered", "entry.field.json", "entry.review.json",
+        "abort.intent.json", "abort.revoked.json",
+    }
     names = set(os.listdir(path))
-    if not required.issubset(names) or names - allowed:
+    if ((not allow_partial and not required.issubset(names)) or names - allowed):
         fail("CLEANUP_ENTRY_SET")
     for name in ("payload", "ns"):
+        if allow_partial and name not in names:
+            continue
         st = os.lstat(os.path.join(path, name))
         if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != 0:
             fail("CLEANUP_NODE_TYPE")
     payload = os.path.join(path, "payload")
-    if set(os.listdir(payload)) != {"engine.py", "archive.py"}:
+    if "payload" in names and ((not allow_partial and set(os.listdir(payload)) != {"engine.py", "archive.py"}) or
+                                (allow_partial and set(os.listdir(payload)) - {"engine.py", "archive.py"})):
         fail("CLEANUP_ENTRY_SET")
-    if os.listdir(os.path.join(path, "ns")):
+    if "ns" in names and os.listdir(os.path.join(path, "ns")):
         fail("CLEANUP_ENTRY_SET")
     for name in names - {"payload", "ns"}:
         st = os.lstat(os.path.join(path, name))
         if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or st.st_nlink != 1:
             fail("CLEANUP_NODE_TYPE")
-    for role in ("field", "review"):
-        _seat_state(path, role, allow_malformed=allow_incomplete)
+    if not allow_partial:
+        for role in ("field", "review"):
+            _seat_state(path, role, allow_malformed=allow_incomplete)
 
 
-def _remove_checkout(path, expected_commit, expected_uid):
+def _active_meta_digests():
+    active_raw, _ = _read_regular(ACTIVE, 0, 0o600, 8192)
+    active = _json_exact(active_raw, {"run_dir", "run_name", "terminal_dir", "source_checkout", "deadline", "sudoers_path",
+        "sudoers_sha256", "source_commit", "stage_script_sha256", "operator_uid",
+        "root_entry_path", "root_entry_sha256"}, "ACTIVE_INVALID")
+    meta_raw, _ = _read_regular(os.path.join(active["run_dir"], "meta.json"), 0, 0o600, 65536)
+    return active, meta_raw, hashlib.sha256(active_raw).hexdigest(), hashlib.sha256(meta_raw).hexdigest()
+
+
+def _abort_bindings(active, meta, active_sha, meta_sha):
+    return {
+        "schema_version": 1,
+        "run_name": active["run_name"],
+        "run_dir": active["run_dir"],
+        "active_sha256": active_sha,
+        "meta_sha256": meta_sha,
+        "source_checkout": meta["source_checkout"],
+        "source_commit": meta["source_commit"],
+        "operator_uid": meta["operator_uid"],
+        "deadline": meta["deadline"],
+        "stage_script_sha256": meta["stage_script_sha256"],
+        "root_entry_path": meta["root_entry_path"],
+        "root_entry_sha256": meta["root_entry_sha256"],
+        "sudoers_path": active["sudoers_path"],
+        "sudoers_sha256": active["sudoers_sha256"],
+    }
+
+
+def _abort_intent_keys():
+    return set(_abort_bindings(
+        {"run_name": "", "run_dir": "", "sudoers_path": "", "sudoers_sha256": ""},
+        {"source_checkout": "", "source_commit": "", "operator_uid": 1, "deadline": 1,
+         "stage_script_sha256": "", "root_entry_path": "", "root_entry_sha256": ""},
+        "", ""))
+
+
+def _read_abort_intent(run_dir, active, meta, active_sha, meta_sha):
+    path = os.path.join(run_dir, "abort.intent.json")
+    raw, _ = _read_regular(path, 0, 0o600, 4096)
+    obj = _json_exact(raw, _abort_intent_keys() | {"state", "requested_utc"}, "ABORT_INTENT_INVALID")
+    expected = _abort_bindings(active, meta, active_sha, meta_sha)
+    if any(obj.get(key) != value for key, value in expected.items()) or obj["state"] != "ABORTING":
+        fail("ABORT_BINDING_MISMATCH")
+    if not _valid_utc_timestamp(obj["requested_utc"]):
+        fail("ABORT_INTENT_INVALID")
+    return obj, raw
+
+
+def _read_abort_revoked(run_dir, intent):
+    path = os.path.join(run_dir, "abort.revoked.json")
+    raw, _ = _read_regular(path, 0, 0o600, 4096)
+    keys = _abort_intent_keys() | {"state", "requested_utc", "rule_absent", "visudo", "verified_utc"}
+    obj = _json_exact(raw, keys, "ABORT_REVOKED_INVALID")
+    for key, value in intent.items():
+        if key == "state":
+            continue
+        if obj.get(key) != value:
+            fail("ABORT_BINDING_MISMATCH")
+    if (obj["state"] != "REVOKED" or obj["rule_absent"] is not True or obj["visudo"] != "PASS" or
+            not _valid_utc_timestamp(obj["verified_utc"]) or
+            _utc_epoch(obj["verified_utc"]) < _utc_epoch(intent["requested_utc"])):
+        fail("ABORT_REVOKED_INVALID")
+    return obj, raw
+
+
+def _valid_utc_timestamp(value):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        return False
+    try:
+        parsed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+        return parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value
+    except ValueError:
+        return False
+
+
+def _utc_epoch(value):
+    if not _valid_utc_timestamp(value):
+        fail("ABORT_TIMESTAMP_INVALID")
+    return int(datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc).timestamp())
+
+
+def _sudoers_entry_present(active):
+    path = active["sudoers_path"]
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode) or st.st_uid != 0 or
+            st.st_gid != 0 or stat.S_IMODE(st.st_mode) != 0o440 or st.st_nlink != 1):
+        fail("SUDOERS_ENTRY_DRIFT")
+    if _file_sha256(path) != active["sudoers_sha256"]:
+        fail("SUDOERS_ENTRY_DRIFT")
+    return True
+
+
+def _sudoers_global_check():
+    try:
+        result = subprocess.run(["/usr/sbin/visudo", "-c", "-q"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                env={"PATH": "/usr/sbin:/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+                                timeout=8, check=False)
+    except Exception:
+        fail("VISUDO_UNAVAILABLE")
+    if result.returncode:
+        fail("VISUDO_READBACK_FAILED")
+
+
+def _abort():
+    _check_root()
+    active = _active_read()
+    run_dir = active["run_dir"]
+    lockfd = _locked(run_dir)
+    try:
+        active, _, _, _ = _active_meta_digests()
+        if active["run_dir"] != run_dir:
+            fail("ACTIVE_CHANGED")
+        meta = _load_meta(run_dir)
+        _check_active_meta(active, meta, "abort")
+        terminal, _ = _terminal_read(active["terminal_dir"])
+        if terminal["phase"] == "RUNNING":
+            # The first abort must prove that this exact temporary rule still
+            # exists before the durable intent is recorded.
+            if not _sudoers_entry_present(active):
+                fail("ABORT_RULE_ABSENT")
+            return _terminal_finish(active["terminal_dir"], "abort", False, False)
+        if terminal["operation"] != "abort":
+            fail("TERMINAL_OPERATION_MISMATCH")
+        return _terminal_finish(active["terminal_dir"], "abort")
+    finally:
+        os.close(lockfd)
+
+def _validate_aborted_receipt(path, active, meta, active_sha, meta_sha):
+    raw, _ = _read_regular(path, 0, 0o600, 8192)
+    keys = {"schema_version", "state", "run_name", "run_dir", "active_sha256", "meta_sha256",
+            "source_checkout", "source_commit", "operator_uid", "deadline", "stage_script_sha256",
+            "root_entry_path", "root_entry_sha256", "sudoers_path", "sudoers_sha256",
+            "abort_intent_sha256", "abort_revoked_sha256", "host_snapshots", "host_config_absent",
+            "field_completed", "review_completed", "seat_status", "aborted_utc"}
+    obj = _json_exact(raw, keys, "ABORT_RECEIPT_INVALID")
+    expected = {
+        "schema_version": 1, "state": "ABORTED_INCOMPLETE",
+        "run_name": active["run_name"], "run_dir": active["run_dir"],
+        "active_sha256": active_sha, "meta_sha256": meta_sha,
+        "source_checkout": meta["source_checkout"], "source_commit": meta["source_commit"],
+        "operator_uid": meta["operator_uid"], "deadline": meta["deadline"],
+        "stage_script_sha256": meta["stage_script_sha256"],
+        "root_entry_path": meta["root_entry_path"], "root_entry_sha256": meta["root_entry_sha256"],
+        "sudoers_path": active["sudoers_path"], "sudoers_sha256": active["sudoers_sha256"],
+        "abort_intent_sha256": hashlib.sha256(_read_abort_intent(
+            active["run_dir"], active, meta, active_sha, meta_sha)[1]).hexdigest(),
+        "abort_revoked_sha256": hashlib.sha256(_read_abort_revoked(
+            active["run_dir"], _read_abort_intent(active["run_dir"], active, meta, active_sha, meta_sha)[0])[1]).hexdigest(),
+    }
+    if any(obj.get(key) != value for key, value in expected.items()):
+        fail("ABORT_RECEIPT_BINDING")
+    if (obj["seat_status"] != "INCOMPLETE" or type(obj["field_completed"]) is not bool or
+            type(obj["review_completed"]) is not bool or obj["host_config_absent"] is not True or
+            not isinstance(obj["host_snapshots"], dict) or
+            set(obj["host_snapshots"]) != {"/usr/local/sbin", "/etc/sudoers.d", "/run/systemd", "/run/dbus"} or
+            obj["host_snapshots"] != meta["host_snapshots"] or
+            any(not isinstance(v, str) or not HEX64.fullmatch(v) for v in obj["host_snapshots"].values()) or
+            not _valid_utc_timestamp(obj["aborted_utc"])):
+        fail("ABORT_RECEIPT_INVALID")
+    return obj, raw
+
+
+def _validate_checkout_for_cleanup(path, expected_commit, expected_uid):
     if not SOURCE_PATH.fullmatch(path):
         fail("SOURCE_PATH_POLICY")
     if not os.path.lexists(path):
-        return "ALREADY_ABSENT"
+        fail("CHECKOUT_MISSING")
     st = os.lstat(path)
     if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or
             st.st_uid != expected_uid or stat.S_IMODE(st.st_mode) != 0o700 or
@@ -1172,6 +2342,55 @@ def _remove_checkout(path, expected_commit, expected_uid):
         fail("CHECKOUT_CLEANUP_REFUSED")
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
         fail("SAFE_RMTREE_UNAVAILABLE")
+    _check_checkout_tree(path, expected_uid, partial=False)
+
+
+def _check_checkout_tree(path, expected_uid, partial):
+    root = os.lstat(path)
+    if (not stat.S_ISDIR(root.st_mode) or stat.S_ISLNK(root.st_mode) or root.st_uid != expected_uid or
+            stat.S_IMODE(root.st_mode) != 0o700 or os.path.realpath(path) != path):
+        fail("CHECKOUT_CLEANUP_REFUSED")
+    root_dev = root.st_dev
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            fail("CHECKOUT_CLEANUP_REFUSED")
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                fail("CHECKOUT_CLEANUP_REFUSED")
+            if (st.st_dev != root_dev or st.st_uid != expected_uid or stat.S_ISLNK(st.st_mode) or
+                    st.st_nlink != 1 and stat.S_ISREG(st.st_mode)):
+                fail("CHECKOUT_CLEANUP_REFUSED")
+            if stat.S_ISDIR(st.st_mode):
+                stack.append(entry.path)
+            elif not stat.S_ISREG(st.st_mode):
+                fail("CHECKOUT_CLEANUP_REFUSED")
+
+
+def _remove_checkout(path, expected_commit, expected_uid, allow_partial=False):
+    if not SOURCE_PATH.fullmatch(path):
+        fail("SOURCE_PATH_POLICY")
+    if not os.path.lexists(path):
+        return "ALREADY_ABSENT"
+    st = os.lstat(path)
+    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or
+            st.st_uid != expected_uid or stat.S_IMODE(st.st_mode) != 0o700 or
+            os.path.realpath(path) != path):
+        fail("CHECKOUT_CLEANUP_REFUSED")
+    if allow_partial:
+        # CHECKOUT_INTENT is persisted only after an exact clean commit/status
+        # validation. A crash during rmtree can resume by checking the fixed
+        # owned tree without executing Git against a partially removed .git.
+        _check_checkout_tree(path, expected_uid, partial=True)
+    else:
+        _validate_checkout_for_cleanup(path, expected_commit, expected_uid)
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        fail("SAFE_RMTREE_UNAVAILABLE")
     shutil.rmtree(path)
     if os.path.lexists(path):
         fail("CLEANUP_READBACK_FAILED")
@@ -1180,13 +2399,15 @@ def _remove_checkout(path, expected_commit, expected_uid):
 
 def _close():
     _check_root()
-    active = _active_read()
-    run_dir = active["run_dir"]
-    meta = _load_meta(run_dir)
-    if meta["sudoers_sha256"] != active["sudoers_sha256"]:
-        fail("ACTIVE_BINDING_MISMATCH")
+    observed = _active_read()
+    run_dir = observed["run_dir"]
     lockfd = _locked(run_dir)
     try:
+        active, _, _, _ = _active_meta_digests()
+        if active["run_dir"] != run_dir:
+            fail("ACTIVE_CHANGED")
+        meta = _load_meta(run_dir)
+        _check_active_meta(active, meta, "close")
         _close_locked(active, meta, run_dir)
     finally:
         os.close(lockfd)
@@ -1205,89 +2426,17 @@ def _close_locked(active, meta, run_dir):
     review_complete = _close_seat_state(
         lambda: _seat_state(run_dir, "review", meta["deadline"], allow_malformed=expired), expired)
     seat_status = _close_seat_status(field_complete, review_complete, expired)
-    # Stop only this window's watchdog. It is never a service and is never
-    # allowed to survive this exact staging session.
-    watchdog_path = os.path.join(run_dir, "watchdog.pid")
-    if os.path.exists(watchdog_path):
-        raw, _ = _read_regular(watchdog_path, 0, 0o600, 64)
-        try:
-            watchdog_pid = int(raw.decode("ascii").strip())
-        except Exception:
-            fail("WATCHDOG_RECORD_INVALID")
-        if watchdog_pid != os.getpid():
-            try:
-                proc_stat = open("/proc/" + str(watchdog_pid) + "/stat", "rt", encoding="ascii").read()
-                state = proc_stat.rsplit(") ", 1)[1].split(" ", 1)[0]
-                if state == "Z":
-                    cmd, cwd = None, None
-                else:
-                    cmd = open("/proc/" + str(watchdog_pid) + "/cmdline", "rb").read().split(b"\0")
-                    cwd = os.readlink("/proc/" + str(watchdog_pid) + "/cwd")
-            except FileNotFoundError:
-                cmd, cwd = None, None
-            except OSError:
-                fail("WATCHDOG_IDENTITY_MISMATCH")
-            if cmd is not None:
-                if not _watchdog_identity_matches(cmd, cwd, run_dir, meta["source_checkout"]):
-                    fail("WATCHDOG_IDENTITY_MISMATCH")
-                try:
-                    os.kill(watchdog_pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    fail("WATCHDOG_STOP_FAILED")
-                for _ in range(100):
-                    try:
-                        os.kill(watchdog_pid, 0)
-                    except ProcessLookupError:
-                        break
-                    time.sleep(0.02)
-                else:
-                    fail("WATCHDOG_STOP_FAILED")
-    _assert_no_window_processes(run_dir, os.getpid())
-    sudo_status = _sudoers_remove(active)
-    expiry_seen = "NO"
-    if os.path.lexists(expired_receipt):
-        raw_expired, _ = _read_regular(expired_receipt, 0, 0o600, 2048)
-        expiry_seen = "YES" if raw_expired.startswith(b"STATUS=EXPIRED\n") else "NO"
-    bootstrap_status = "ABSENT"
-    if os.path.lexists(BOOTSTRAP):
-        bootstrap_raw, _ = _read_regular(BOOTSTRAP, 0, 0o600, 65536)
-        if hashlib.sha256(bootstrap_raw).hexdigest() != meta["bootstrap_sha256"]:
-            fail("BOOTSTRAP_DRIFT")
-        os.unlink(BOOTSTRAP)
-        bootstrap_status = "REMOVED"
-    host_config_absent = not os.path.lexists("/etc/lab-fixture-digest")
-    host_snapshots = _host_snapshots()
-    snapshot_status = "UNCHANGED" if host_snapshots == meta["host_snapshots"] else "DRIFT"
-    closed_path = os.path.join(RUN_BASE, active["run_name"] + ".closed.json")
-    closed = {
-        "schema_version": 1, "run_name": active["run_name"], "run_dir": run_dir,
-        "source_checkout": meta["source_checkout"], "source_commit": meta["source_commit"],
-        "operator_uid": meta["operator_uid"],
-        "host_mnt_ns": meta["host_mnt_ns"], "host_net_ns": meta["host_net_ns"],
-        "stage_script_sha256": meta["stage_script_sha256"],
-        "sudoers_path": active["sudoers_path"], "sudoers_sha256": active["sudoers_sha256"],
-        "deadline": meta["deadline"], "host_snapshots": meta["host_snapshots"],
-        "sudoers_status": sudo_status, "bootstrap_status": bootstrap_status,
-        "host_config_absent": host_config_absent, "host_snapshot_status": snapshot_status,
-        "automatic_expiry": expiry_seen, "field_completed": field_complete,
-        "review_completed": review_complete, "seat_status": seat_status,
-    }
-    _write_new(closed_path, json.dumps(closed, sort_keys=True, separators=(",", ":")) + "\n", 0o600)
-    os.unlink(ACTIVE)
-    _safe_remove_tree(run_dir, active["run_name"], allow_incomplete=expired)
-    _best_effort_remove(expired_receipt)
-    print("STATUS=CLOSED")
-    print("SUDOERS=" + sudo_status)
-    print("BOOTSTRAP=" + bootstrap_status)
-    print("HOST_CONFIG_PATH=" + ("ABSENT" if host_config_absent else "PRESENT"))
-    print("HOST_DIRECTORY_BASELINES=" + snapshot_status)
-    print("SEATS=" + seat_status)
-    print("RUN_DIRECTORY=ABSENT")
-    print("ACTIVE_POINTER=ABSENT")
-    print("INDEPENDENT_READBACK=REQUIRED path=" + closed_path)
-    return 0
+    if not expired and seat_status != "COMPLETE":
+        fail("SEATS_INCOMPLETE")
+    record, _ = _terminal_read(active["terminal_dir"])
+    operation = record["operation"] if record["operation"] != "running" else ("expire" if expired else "close")
+    if operation == "running":
+        fail("TERMINAL_OPERATION_REQUIRED")
+    if operation == "abort":
+        fail("ABORT_IN_PROGRESS")
+    return _terminal_finish(active["terminal_dir"],
+                           None if record["operation"] != "running" else operation,
+                           field_complete, review_complete)
 
 
 def _assert_no_window_processes(run_dir, self_pid):
@@ -1317,82 +2466,138 @@ def _watchdog_identity_matches(cmd, cwd, run_dir, source_checkout):
 
 def _readback():
     _check_root()
-    run_st = os.lstat(RUN_BASE)
-    if not stat.S_ISDIR(run_st.st_mode) or stat.S_ISLNK(run_st.st_mode) or os.path.realpath(RUN_BASE) != RUN_BASE or run_st.st_uid != 0:
-        fail("RUN_DIRECTORY")
-    candidates = sorted(name for name in os.listdir(RUN_BASE)
-                        if RUN_NAME.fullmatch(name[:-12]) and name.endswith(".closed.json"))
-    if len(candidates) != 1:
-        fail("CLOSED_RECEIPT_COUNT")
-    path = os.path.join(RUN_BASE, candidates[0])
-    blob, _ = _read_regular(path, 0, 0o600, 16384)
-    closed = _json_exact(blob, {"schema_version", "run_name", "run_dir", "source_checkout", "source_commit",
-        "operator_uid", "host_mnt_ns", "host_net_ns", "stage_script_sha256", "sudoers_path", "sudoers_sha256", "deadline",
-                                "host_snapshots", "sudoers_status", "bootstrap_status", "host_config_absent",
-                                "host_snapshot_status", "automatic_expiry", "field_completed",
-                                "review_completed", "seat_status"}, "CLOSED_RECORD_INVALID")
-    if (closed["schema_version"] != 1 or not RUN_NAME.fullmatch(closed["run_name"]) or
-            closed["run_dir"] != os.path.join(RUN_BASE, closed["run_name"]) or
-            closed["sudoers_path"] != os.path.join(SUDOERS_DIR, closed["run_name"]) or
-            not SOURCE_PATH.fullmatch(closed["source_checkout"])):
-        fail("CLOSED_RECORD_INVALID")
-    if candidates[0] != closed["run_name"] + ".closed.json":
-        fail("CLOSED_RECORD_INVALID")
-    if (type(closed["field_completed"]) is not bool or type(closed["review_completed"]) is not bool or
-            closed["seat_status"] not in ("COMPLETE", "INCOMPLETE") or
-            closed["seat_status"] != ("COMPLETE" if closed["field_completed"] and closed["review_completed"] else "INCOMPLETE")):
-        fail("CLOSED_RECORD_INVALID")
-    if (not isinstance(closed["host_snapshots"], dict) or
-            set(closed["host_snapshots"]) != {"/usr/local/sbin", "/etc/sudoers.d", "/run/systemd", "/run/dbus"} or
-            any(not isinstance(value, str) or not HEX64.fullmatch(value) for value in closed["host_snapshots"].values()) or
-            type(closed["operator_uid"]) is not int or closed["operator_uid"] <= 0):
-        fail("CLOSED_RECORD_INVALID")
-    if (os.readlink("/proc/self/ns/mnt") != closed["host_mnt_ns"] or
-            os.readlink("/proc/self/ns/net") != closed["host_net_ns"]):
-        fail("READBACK_NAMESPACE")
-    if os.path.lexists(ACTIVE) or os.path.lexists(BOOTSTRAP):
-        fail("CLOSE_READBACK_FAILED")
-    if os.path.lexists(closed["run_dir"]):
-        _safe_remove_tree(closed["run_dir"], closed["run_name"])
-    if os.path.lexists(closed["run_dir"]):
-        fail("CLOSE_READBACK_FAILED")
-    if os.path.lexists(closed["sudoers_path"]):
-        fail("CLOSE_READBACK_FAILED")
-    if os.path.lexists("/etc/lab-fixture-digest"):
-        fail("CLOSE_READBACK_FAILED")
-    if _host_snapshots() != closed["host_snapshots"] or closed["host_snapshot_status"] != "UNCHANGED":
-        fail("HOST_PATH_DRIFT")
-    if not closed["host_config_absent"] or closed["bootstrap_status"] != "ABSENT" or closed["sudoers_status"] not in ("REMOVED_AND_VALIDATED", "ALREADY_ABSENT"):
-        fail("CLOSE_READBACK_FAILED")
+    active = None
+    if os.path.lexists(ACTIVE):
+        active = _active_read()
+        terminal_dir = active["terminal_dir"]
+    else:
+        binding = ROOT_ENTRY_BINDING or {}
+        terminal_dir = binding.get("terminal_dir")
+        if not isinstance(terminal_dir, str) or not TERMINAL_NAME.fullmatch(os.path.basename(terminal_dir)):
+            fail("TERMINAL_READBACK_BINDING")
+    record, _ = _terminal_read(terminal_dir)
+    if active is not None:
+        runfd = _locked(active["run_dir"])
+    elif os.path.isdir(record["run_dir"]):
+        runfd = _locked(record["run_dir"])
+    else:
+        runfd = None
     try:
-        result = subprocess.run(["/usr/sbin/visudo", "-c", "-q"], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                env={"PATH": "/usr/sbin:/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
-                                timeout=8, check=False)
-    except Exception:
-        fail("VISUDO_UNAVAILABLE")
-    if result.returncode:
-        fail("VISUDO_READBACK_FAILED")
-    if _mounts_for_run(closed["run_dir"]):
-        fail("MOUNT_READBACK_FAILED")
-    _assert_no_window_processes(closed["run_dir"], os.getpid())
-    verify_source(closed["source_checkout"], closed["source_commit"], closed["operator_uid"])
-    expected_stage_script = os.path.join(closed["source_checkout"], "ops", "lab-g3-archive-a", "stage-window.py")
-    if SCRIPT != expected_stage_script or _file_sha256(expected_stage_script) != closed["stage_script_sha256"]:
-        fail("STAGE_SCRIPT_HASH")
-    checkout_status = _remove_checkout(closed["source_checkout"], closed["source_commit"], closed["operator_uid"])
-    os.unlink(path)
-    readback_status = "READBACK_PASS" if closed["seat_status"] == "COMPLETE" else "READBACK_INCOMPLETE"
-    print("STATUS=" + readback_status)
-    print("SUDOERS=ABSENT_AND_VISUDO_VALID")
-    print("ACTIVE_BOOTSTRAP_STAGE=ABSENT")
-    print("HOST_CONFIG_PATH=ABSENT")
-    print("HOST_DIRECTORY_BASELINES=UNCHANGED")
-    print("MOUNT_NAMESPACE_RESIDUE=ABSENT")
-    print("SEATS=" + closed["seat_status"])
-    print("CHECKOUT=" + checkout_status)
-    print("CLOSED_RECORD=REMOVED")
-    return 0 if closed["seat_status"] == "COMPLETE" else 3
+        if record["phase"] not in ("COMPLETE", "READBACK_DONE"):
+            if record["phase"] == "RUNNING":
+                fail("READBACK_STATE")
+            _terminal_finish(terminal_dir)
+            record, _ = _terminal_read(terminal_dir)
+        return _terminal_verify_and_mark_readback(terminal_dir, record)
+    finally:
+        if runfd is not None:
+            os.close(runfd)
+
+
+def _terminal_verify_and_mark_readback(terminal_dir, record):
+    record, _ = _terminal_read(terminal_dir)
+    if record["phase"] not in ("COMPLETE", "READBACK_DONE"):
+        fail("TERMINAL_NOT_COMPLETE")
+    if (os.path.lexists(ACTIVE) or os.path.lexists(BOOTSTRAP) or
+            os.path.lexists(record["run_dir"]) or os.path.lexists(record["sudoers_path"]) or
+            os.path.lexists(record["source_checkout"]) or os.path.lexists("/etc/lab-fixture-digest")):
+        fail("TERMINAL_READBACK_PATH_PRESENT")
+    if _host_snapshots() != record["host_snapshots"]:
+        fail("TERMINAL_READBACK_HOST_DRIFT")
+    _sudoers_global_check()
+    if (os.readlink("/proc/self/ns/mnt") != record["host_mnt_ns"] or
+            os.readlink("/proc/self/ns/net") != record["host_net_ns"]):
+        fail("TERMINAL_READBACK_NAMESPACE")
+    if record["phase"] == "COMPLETE":
+        record = _terminal_advance(terminal_dir, phase="READBACK_DONE")
+    entry_path = record["root_entry_path"]
+    entry_sha = record["root_entry_sha256"]
+    binding = ROOT_ENTRY_BINDING or {}
+    if binding.get("path") != entry_path or binding.get("sha256") != entry_sha:
+        fail("TERMINAL_ROOT_ENTRY_BINDING")
+    if os.path.lexists(entry_path):
+        _remove_root_entry(entry_path, entry_sha)
+    if os.path.lexists(entry_path):
+        fail("TERMINAL_ROOT_ENTRY_PRESENT")
+    seat_status = "COMPLETE" if record["field_completed"] and record["review_completed"] else "INCOMPLETE"
+    print("STATUS=READBACK_" + seat_status)
+    print("TERMINAL_JOURNAL=READBACK_DONE")
+    print("ROOT_ENTRY=ABSENT")
+    print("HOST_BASELINES=UNCHANGED")
+    return 0 if seat_status == "COMPLETE" else 3
+
+def _readback_aborted(active, meta):
+    """Independently verify and remove only this run's aborted A-window state."""
+    run_dir = active["run_dir"]
+    lockfd = _locked(run_dir)
+    try:
+        active, meta_raw, active_sha, meta_sha = _active_meta_digests()
+        meta = _load_meta(run_dir)
+        _check_active_meta(active, meta, "readback")
+        if not _is_aborting(run_dir):
+            fail("ABORT_STATE_MISSING")
+        receipt_path = os.path.join(RUN_BASE, active["run_name"] + ".aborted.json")
+        receipt, _ = _validate_aborted_receipt(receipt_path, active, meta, active_sha, meta_sha)
+        if os.path.lexists(active["sudoers_path"]):
+            fail("ABORT_RULE_REAPPEARED")
+        if os.path.lexists(BOOTSTRAP):
+            fail("ABORT_BOOTSTRAP_PRESENT")
+        if os.path.lexists("/etc/lab-fixture-digest") or not receipt["host_config_absent"]:
+            fail("ABORT_HOST_CONFIG_PRESENT")
+        if _host_snapshots() != receipt["host_snapshots"] or receipt["host_snapshots"] != meta["host_snapshots"]:
+            fail("ABORT_HOST_DRIFT")
+        _sudoers_global_check()
+        _assert_no_window_processes(run_dir, os.getpid())
+        if _mounts_for_run(run_dir):
+            fail("ABORT_MOUNT_ACTIVE")
+        if os.path.lexists(os.path.join(run_dir, "watchdog.pid")):
+            # The watchdog record must exist in the preserved run; its process
+            # may have exited after writing it. A live matching process means
+            # abort failed to stop it and readback must remain blocked.
+            try:
+                record = _watchdog_record(run_dir)
+                pidfd = os.pidfd_open(record["pid"], 0)
+            except ProcessLookupError:
+                pidfd = None
+            except Refusal as exc:
+                if exc.category == "WATCHDOG_RECORD_INVALID":
+                    raise
+                pidfd = None
+            except OSError:
+                fail("WATCHDOG_READBACK_UNAVAILABLE")
+            if pidfd is not None:
+                try:
+                    poller = select.poll()
+                    poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+                    if not poller.poll(0):
+                        fail("WATCHDOG_STILL_RUNNING")
+                finally:
+                    os.close(pidfd)
+        verify_source(meta["source_checkout"], meta["source_commit"], meta["operator_uid"])
+        expected_stage_script = os.path.join(meta["source_checkout"], "ops", "lab-g3-archive-a", "stage-window.py")
+        if SCRIPT != expected_stage_script or _file_sha256(expected_stage_script) != meta["stage_script_sha256"]:
+            fail("STAGE_SCRIPT_HASH")
+        _remove_checkout(meta["source_checkout"], meta["source_commit"], meta["operator_uid"])
+        os.unlink(ACTIVE)
+        _safe_remove_tree(run_dir, active["run_name"], allow_incomplete=True)
+        if os.path.lexists(ACTIVE) or os.path.lexists(run_dir) or os.path.lexists(active["sudoers_path"]):
+            fail("ABORT_READBACK_FAILED")
+        os.unlink(receipt_path)
+        if os.path.lexists(receipt_path):
+            fail("ABORT_READBACK_FAILED")
+        _remove_root_entry(meta["root_entry_path"], meta["root_entry_sha256"])
+        print("STATUS=READBACK_ABORTED_INCOMPLETE")
+        print("SUDOERS=ABSENT_AND_VISUDO_VALID")
+        print("ACTIVE_BOOTSTRAP_STAGE=ABSENT")
+        print("HOST_CONFIG_PATH=ABSENT")
+        print("HOST_DIRECTORY_BASELINES=UNCHANGED")
+        print("MOUNT_NAMESPACE_RESIDUE=ABSENT")
+        print("SEATS=INCOMPLETE")
+        print("CHECKOUT=REMOVED")
+        print("ABORT_RECEIPT=REMOVED")
+        return 3
+    finally:
+        os.close(lockfd)
 
 
 def _mounts_for_run(run_dir):
@@ -1416,17 +2621,12 @@ def _best_effort_remove(path):
 
 def _best_effort_stop_watchdog(run_dir):
     try:
-        raw, _ = _read_regular(os.path.join(run_dir, "watchdog.pid"), 0, 0o600, 64)
-        pid = int(raw.decode("ascii").strip())
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(100):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return
-            time.sleep(0.02)
+        if os.path.lexists(os.path.join(run_dir, "watchdog.pid")):
+            _stop_watchdog(run_dir)
+        _assert_no_window_processes(run_dir, os.getpid())
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _best_effort_remove_tree(path):
@@ -1454,6 +2654,8 @@ def main(argv=None):
             return _watchdog()
         if argv == ["close"]:
             return _close()
+        if argv == ["abort"]:
+            return _abort()
         if argv == ["readback"]:
             return _readback()
         print("STATUS=FAIL CATEGORY=ARGUMENTS")
@@ -1475,8 +2677,16 @@ def _watchdog():
     watchdog_path = os.path.join(run_dir, "watchdog.pid")
     if os.path.lexists(watchdog_path):
         fail("WATCHDOG_RECORD_EXISTS")
-    _write_new(watchdog_path, str(os.getpid()) + "\n", 0o600)
+    argv = _watchdog_exec_argv(run_dir)
+    record = {
+        "pid": os.getpid(), "starttime": _process_starttime(os.getpid()),
+        "cwd": active["source_checkout"],
+        "argv_sha256": hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest(),
+    }
+    _write_new(watchdog_path, json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", 0o600)
     while int(time.time()) < active["deadline"]:
+        if _is_aborting(run_dir):
+            return 0
         time.sleep(min(1.0, max(0.05, active["deadline"] - time.time())))
     _expire_window()
     return 0

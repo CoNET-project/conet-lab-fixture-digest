@@ -1,9 +1,14 @@
 """Pure synthetic tests for the short-lived A-window controller."""
 import hashlib
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
+import re
+import stat
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -14,6 +19,14 @@ MODULE_PATH = HERE.parents[1] / "ops" / "lab-g3-archive-a" / "stage-window.py"
 SPEC = importlib.util.spec_from_file_location("lab_g3_archive_a_stage", MODULE_PATH)
 MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
+ROOT_ENTRY_PATH = HERE.parents[1] / "ops" / "lab-g3-archive-a" / "root-entry.py"
+ROOT_SPEC = importlib.util.spec_from_file_location("lab_g3_archive_a_root_entry", ROOT_ENTRY_PATH)
+ROOT = importlib.util.module_from_spec(ROOT_SPEC)
+ROOT_SPEC.loader.exec_module(ROOT)
+INSTALL_PATH = HERE.parents[1] / "ops" / "lab-g3-archive-a" / "root-install.py"
+INSTALL_SPEC = importlib.util.spec_from_file_location("lab_g3_archive_a_root_install", INSTALL_PATH)
+INSTALL = importlib.util.module_from_spec(INSTALL_SPEC)
+INSTALL_SPEC.loader.exec_module(INSTALL)
 
 
 def synthetic_bootstrap():
@@ -33,6 +46,30 @@ def synthetic_bootstrap():
         "v2_previous_generation": "gen-20261123T000000Z-abcdef123456",
         "archive_manifest_sha256": "e" * 64,
         "archive_wal_sha256": "f" * 64,
+        "root_entry_path": "/run/lab-g3-archive-a-loader-123456abcdef.py",
+        "root_entry_sha256": "9" * 64,
+    }
+
+
+def terminal_record():
+    run_name = "lab-g3-archive-a-20261124T010000Z-abcdef123456"
+    return {
+        "schema_version": 1, "run_name": run_name,
+        "run_dir": "/run/" + run_name,
+        "terminal_dir": "/run/lab-g3-archive-a-terminal/" + run_name + ".journal",
+        "operation": "running", "state": "RUNNING", "phase": "RUNNING", "revision": 0,
+        "source_checkout": "/var/tmp/lab-archive-a-src.Synth001", "source_commit": "a" * 40,
+        "operator_uid": 1001, "deadline": 9999999999,
+        "stage_script_sha256": "b" * 64,
+        "root_entry_path": "/run/lab-g3-archive-a-loader-abcdef123456.py",
+        "root_entry_sha256": "c" * 64,
+        "sudoers_path": "/etc/sudoers.d/" + run_name, "sudoers_sha256": "d" * 64,
+        "active_sha256": "e" * 64, "meta_sha256": "f" * 64,
+        "bootstrap_sha256": "1" * 64,
+        "host_snapshots": {path: str(i) * 64 for i, path in enumerate(
+            ("/usr/local/sbin", "/etc/sudoers.d", "/run/systemd", "/run/dbus"), start=1)},
+        "host_mnt_ns": "mnt:[10]", "host_net_ns": "net:[11]",
+        "field_completed": False, "review_completed": False,
     }
 
 
@@ -68,6 +105,609 @@ def valid_entry_output():
 
 
 class StageWindowTests(unittest.TestCase):
+    def test_prepare_blocks_unconsumed_root_install_spec_before_session_creation(self):
+        with mock.patch.object(MOD, "_check_root"), \
+                mock.patch.object(MOD, "_host_preflight"), \
+                mock.patch.object(MOD.os.path, "lexists",
+                                  side_effect=lambda path: path == MOD.INSTALL_SPEC), \
+                mock.patch.object(MOD, "_terminal_preflight") as terminal_preflight:
+            with self.assertRaises(MOD.Refusal) as caught:
+                MOD._prepare()
+        self.assertEqual(caught.exception.category, "INSTALL_SPEC_PENDING")
+        terminal_preflight.assert_not_called()
+
+    def test_prepare_checks_pending_terminal_journal_before_reading_bootstrap(self):
+        with mock.patch.object(MOD, "_check_root"), \
+                mock.patch.object(MOD, "_host_preflight"), \
+                mock.patch.object(MOD, "_terminal_preflight", side_effect=MOD.Refusal("TERMINAL_PENDING")), \
+                mock.patch.object(MOD, "_read_regular") as read_regular:
+            with self.assertRaises(MOD.Refusal) as caught:
+                MOD._prepare()
+        self.assertEqual(caught.exception.category, "TERMINAL_PENDING")
+        read_regular.assert_not_called()
+
+    def test_terminal_preflight_blocks_unread_terminal_and_allows_readback_done(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = pathlib.Path(temp).resolve() / "terminal"
+            base.mkdir(mode=0o700)
+            name = terminal_record()["run_name"] + ".journal"
+            (base / name).mkdir(mode=0o700)
+            record = terminal_record()
+            with mock.patch.object(MOD, "TERMINAL_BASE", str(base)), \
+                    mock.patch.object(MOD, "TERMINAL_UID", MOD.os.getuid()), \
+                    mock.patch.object(MOD, "TERMINAL_GID", base.stat().st_gid), \
+                    mock.patch.object(MOD, "_terminal_read", return_value=(record, b"{}")):
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._terminal_preflight()
+                self.assertEqual(caught.exception.category, "TERMINAL_PENDING")
+                record["phase"] = "READBACK_DONE"
+                record["state"] = "COMPLETE"
+                MOD._terminal_preflight()
+
+    def test_terminal_create_rolls_back_only_its_partial_nodes(self):
+        source = pathlib.Path(MOD.SCRIPT)
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        run_name = "lab-g3-archive-a-20261124T010000Z-abcdef123456"
+        host = {p: str(i) * 64 for i, p in enumerate(
+            ("/usr/local/sbin", "/etc/sudoers.d", "/run/systemd", "/run/dbus"), start=1)}
+        active = {"run_name": run_name, "run_dir": "/run/" + run_name,
+                  "sudoers_path": "/etc/sudoers.d/" + run_name, "sudoers_sha256": "d" * 64}
+        meta = {"source_checkout": "/var/tmp/lab-archive-a-src.Synth001",
+                "source_commit": "a" * 40, "operator_uid": 1001, "deadline": 9999999999,
+                "stage_script_sha256": source_sha,
+                "root_entry_path": "/run/lab-g3-archive-a-loader-123456abcdef.py",
+                "root_entry_sha256": "c" * 64, "bootstrap_sha256": "1" * 64,
+                "host_snapshots": host, "host_mnt_ns": "mnt:[10]", "host_net_ns": "net:[11]"}
+
+        for fail_after in (1, 2, 3):
+            with self.subTest(fail_after=fail_after), tempfile.TemporaryDirectory() as temp:
+                base = pathlib.Path(temp).resolve() / "terminal"
+                calls = {"count": 0}
+                real_write_new = MOD._write_new
+
+                def fail_after_write(path, content, mode=0o600, created=None):
+                    result = real_write_new(path, content, mode, created=created)
+                    calls["count"] += 1
+                    if calls["count"] == fail_after:
+                        raise RuntimeError("synthetic interruption after durable file")
+                    return result
+
+                with mock.patch.object(MOD, "TERMINAL_BASE", str(base)), \
+                        mock.patch.object(MOD, "RUN_BASE", "/run"), \
+                        mock.patch.object(MOD, "SUDOERS_DIR", "/etc/sudoers.d"), \
+                        mock.patch.object(MOD, "TERMINAL_UID", MOD.os.getuid()), \
+                        mock.patch.object(MOD, "TERMINAL_GID", base.parent.stat().st_gid), \
+                        mock.patch.object(MOD, "_terminal_preflight"), \
+                        mock.patch.object(MOD, "_terminal_read", side_effect=lambda _p: (None, b"")), \
+                        mock.patch.object(MOD.os, "chown"), \
+                        mock.patch.object(MOD.os, "fchown"), \
+                        mock.patch.object(MOD, "_write_new", side_effect=fail_after_write):
+                    with self.assertRaises(RuntimeError):
+                        MOD._terminal_create(active, meta, "e" * 64, "f" * 64)
+                self.assertFalse(base.exists(), "only this invocation's empty journal tree is removed")
+
+    def test_terminal_create_cleans_its_partial_write_by_recorded_inode(self):
+        source = pathlib.Path(MOD.SCRIPT)
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        run_name = "lab-g3-archive-a-20261124T010002Z-abcdef123456"
+        active = {"run_name": run_name, "run_dir": "/run/" + run_name,
+                  "sudoers_path": "/etc/sudoers.d/" + run_name, "sudoers_sha256": "d" * 64}
+        meta = {"source_checkout": "/var/tmp/lab-archive-a-src.Synth001",
+                "source_commit": "a" * 40, "operator_uid": 1001, "deadline": 9999999999,
+                "stage_script_sha256": source_sha,
+                "root_entry_path": "/run/lab-g3-archive-a-loader-123456abcdef.py",
+                "root_entry_sha256": "c" * 64, "bootstrap_sha256": "1" * 64,
+                "host_snapshots": {p: str(i) * 64 for i, p in enumerate(
+                    ("/usr/local/sbin", "/etc/sudoers.d", "/run/systemd", "/run/dbus"), start=1)},
+                "host_mnt_ns": "mnt:[10]", "host_net_ns": "net:[11]"}
+        with tempfile.TemporaryDirectory() as temp:
+            base = pathlib.Path(temp).resolve() / "terminal"
+            real_write = MOD.os.write
+            writes = {"count": 0}
+            def partial_then_fail(fd, data):
+                writes["count"] += 1
+                if writes["count"] == 1:
+                    return real_write(fd, data[:1])
+                raise OSError("synthetic short-write interruption")
+            with mock.patch.object(MOD, "TERMINAL_BASE", str(base)), \
+                    mock.patch.object(MOD, "TERMINAL_UID", MOD.os.getuid()), \
+                    mock.patch.object(MOD, "TERMINAL_GID", base.parent.stat().st_gid), \
+                    mock.patch.object(MOD, "_terminal_preflight"), \
+                    mock.patch.object(MOD.os, "chown"), \
+                    mock.patch.object(MOD.os, "fchown"), \
+                    mock.patch.object(MOD.os, "write", side_effect=partial_then_fail):
+                with self.assertRaises(OSError):
+                    MOD._terminal_create(active, meta, "e" * 64, "f" * 64)
+            self.assertFalse(base.exists())
+
+    def test_terminal_create_leaves_unrecognized_node_for_fail_closed_review(self):
+        source = pathlib.Path(MOD.SCRIPT)
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        run_name = "lab-g3-archive-a-20261124T010001Z-abcdef123456"
+        active = {"run_name": run_name, "run_dir": "/run/" + run_name,
+                  "sudoers_path": "/etc/sudoers.d/" + run_name, "sudoers_sha256": "d" * 64}
+        meta = {"source_checkout": "/var/tmp/lab-archive-a-src.Synth001",
+                "source_commit": "a" * 40, "operator_uid": 1001, "deadline": 9999999999,
+                "stage_script_sha256": source_sha,
+                "root_entry_path": "/run/lab-g3-archive-a-loader-123456abcdef.py",
+                "root_entry_sha256": "c" * 64, "bootstrap_sha256": "1" * 64,
+                "host_snapshots": {p: str(i) * 64 for i, p in enumerate(
+                    ("/usr/local/sbin", "/etc/sudoers.d", "/run/systemd", "/run/dbus"), start=1)},
+                "host_mnt_ns": "mnt:[10]", "host_net_ns": "net:[11]"}
+        with tempfile.TemporaryDirectory() as temp:
+            base = pathlib.Path(temp).resolve() / "terminal"
+            real_write_new = MOD._write_new
+            def add_unrecognized(path, content, mode=0o600, created=None):
+                result = real_write_new(path, content, mode, created=created)
+                if pathlib.Path(path).name == "control.lock":
+                    (pathlib.Path(path).parent / "unknown").write_text("keep", encoding="ascii")
+                    raise RuntimeError("synthetic interruption with foreign entry")
+                return result
+            with mock.patch.object(MOD, "TERMINAL_BASE", str(base)), \
+                    mock.patch.object(MOD, "TERMINAL_UID", MOD.os.getuid()), \
+                    mock.patch.object(MOD, "TERMINAL_GID", base.parent.stat().st_gid), \
+                    mock.patch.object(MOD, "_terminal_preflight"), \
+                    mock.patch.object(MOD.os, "chown"), \
+                    mock.patch.object(MOD.os, "fchown"), \
+                    mock.patch.object(MOD, "_write_new", side_effect=add_unrecognized):
+                with self.assertRaises(RuntimeError):
+                    MOD._terminal_create(active, meta, "e" * 64, "f" * 64)
+            terminal_dir = base / (run_name + ".journal")
+            self.assertTrue((terminal_dir / "unknown").exists())
+            self.assertTrue((terminal_dir / "control.lock").exists())
+            with mock.patch.object(MOD, "_terminal_read", side_effect=MOD.Refusal("TERMINAL_ENTRY_SET")), \
+                    mock.patch.object(MOD, "TERMINAL_BASE", str(base)), \
+                    mock.patch.object(MOD, "TERMINAL_UID", MOD.os.getuid()), \
+                    mock.patch.object(MOD, "TERMINAL_GID", base.stat().st_gid):
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._terminal_preflight()
+                self.assertEqual(caught.exception.category, "TERMINAL_ENTRY_SET")
+
+    def test_terminal_sudoers_and_baseline_failures_preserve_resume_phase(self):
+        record = terminal_record()
+        record.update({"operation": "abort", "state": "ABORTING", "phase": "RULE_INTENT", "revision": 2})
+        binding = {"path": record["root_entry_path"], "sha256": record["root_entry_sha256"],
+                   "verb": "readback", "terminal_dir": record["terminal_dir"], "terminal_phase": "RULE_INTENT"}
+        with mock.patch.object(MOD, "_terminal_lock", return_value=93), \
+                mock.patch.object(MOD, "_terminal_read", return_value=(record, b"{}")), \
+                mock.patch.object(MOD.os, "close"), \
+                mock.patch.object(MOD, "_sudoers_remove", side_effect=MOD.Refusal("SUDOERS_ENTRY_DRIFT")) as remove, \
+                mock.patch.object(MOD, "ROOT_ENTRY_BINDING", binding):
+            with self.assertRaises(MOD.Refusal) as caught:
+                MOD._terminal_finish(record["terminal_dir"])
+        self.assertEqual(caught.exception.category, "SUDOERS_ENTRY_DRIFT")
+        self.assertEqual(record["phase"], "RULE_INTENT")
+        remove.assert_called_once()
+
+        record = terminal_record()
+        record.update({"operation": "abort", "state": "ABORTING", "phase": "CHECKOUT_DONE", "revision": 18})
+        wrong = dict(record["host_snapshots"])
+        wrong["/usr/local/sbin"] = "0" * 64
+        with mock.patch.object(MOD, "_terminal_lock", return_value=94), \
+                mock.patch.object(MOD, "_terminal_read", return_value=(record, b"{}")), \
+                mock.patch.object(MOD.os.path, "lexists", return_value=False), \
+                mock.patch.object(MOD, "_host_snapshots", return_value=wrong), \
+                mock.patch.object(MOD, "_sudoers_global_check"), \
+                mock.patch.object(MOD.os, "close"):
+            with self.assertRaises(MOD.Refusal) as caught:
+                MOD._terminal_finish(record["terminal_dir"])
+        self.assertEqual(caught.exception.category, "TERMINAL_HOST_POSTCHECK")
+        self.assertEqual(record["phase"], "CHECKOUT_DONE")
+
+    def test_terminal_transitions_bind_operation_and_allow_only_readback_after_complete(self):
+        record = terminal_record()
+        closing = MOD._terminal_next(record, operation="close", state="CLOSING",
+                                     field_completed=True, review_completed=True)
+        self.assertEqual(closing["phase"], "INTENT")
+        self.assertEqual(closing["operation"], "close")
+        rule_intent = MOD._terminal_next(closing, phase="RULE_INTENT")
+        self.assertEqual(rule_intent["phase"], "RULE_INTENT")
+        changed = dict(rule_intent)
+        changed["source_commit"] = "9" * 40
+        with self.assertRaises(MOD.Refusal) as caught:
+            MOD._terminal_check_transition(rule_intent, changed)
+        self.assertEqual(caught.exception.category, "TERMINAL_BINDING")
+        done = dict(rule_intent, phase="COMPLETE", state="COMPLETE",
+                    revision=rule_intent["revision"] + 1)
+        with self.assertRaises(MOD.Refusal) as caught:
+            MOD._terminal_check_transition(rule_intent, done)
+        self.assertEqual(caught.exception.category, "TERMINAL_TRANSITION")
+        complete = dict(rule_intent, phase="POSTCHECK_PASS", revision=rule_intent["revision"] + 1)
+        complete = MOD._terminal_next(complete, phase="COMPLETE", state="COMPLETE")
+        readback = MOD._terminal_next(complete, phase="READBACK_DONE")
+        self.assertEqual(readback["state"], "COMPLETE")
+        self.assertEqual(readback["phase"], "READBACK_DONE")
+
+    def test_terminal_cleanup_resumes_each_delete_boundary_and_readback_is_idempotent(self):
+        failures = ("rule", "watchdog", "bootstrap", "active", "run", "checkout")
+        for fail_at in failures:
+            with self.subTest(fail_at=fail_at):
+                record = terminal_record()
+                record["host_mnt_ns"] = "mnt:[10]"
+                record["host_net_ns"] = "net:[11]"
+                record["bootstrap_sha256"] = hashlib.sha256(b"synthetic bootstrap").hexdigest()
+                record["active_sha256"] = hashlib.sha256(b"synthetic active").hexdigest()
+                entry_path = record["root_entry_path"]
+                present = {MOD.BOOTSTRAP, MOD.ACTIVE, record["run_dir"],
+                           record["source_checkout"], record["sudoers_path"],
+                           record["run_dir"] + "/watchdog.pid", entry_path}
+                fired = set()
+                removed = {"rule": 0, "watchdog": 0, "bootstrap": 0, "active": 0, "run": 0, "checkout": 0}
+
+                def maybe_fail(name):
+                    removed[name] += 1
+                    if name == fail_at and name not in fired:
+                        fired.add(name)
+                        raise RuntimeError("synthetic interruption")
+
+                def advance(_path, *, phase=None, operation=None, state=None, **updates):
+                    nonlocal record
+                    record = MOD._terminal_next(record, phase=phase, operation=operation, state=state, **updates)
+                    return record
+
+                def lexists(path):
+                    return path in present
+
+                def isdir(path):
+                    return path == record["run_dir"] and path in present
+
+                def read_regular(path, owner, mode, limit=65536):
+                    raw = b"synthetic bootstrap" if path == MOD.BOOTSTRAP else b"synthetic active"
+                    return raw, None
+
+                def unlink(path):
+                    present.discard(path)
+                    if path == MOD.BOOTSTRAP:
+                        maybe_fail("bootstrap")
+                    elif path == MOD.ACTIVE:
+                        maybe_fail("active")
+
+                def remove_rule(_active):
+                    present.discard(record["sudoers_path"])
+                    maybe_fail("rule")
+                    return "REMOVED_AND_VALIDATED"
+
+                def stop_watchdog(_run, allow_absent=False):
+                    present.discard(record["run_dir"] + "/watchdog.pid")
+                    maybe_fail("watchdog")
+                    return "STOPPED"
+
+                def remove_run(*args, **kwargs):
+                    present.discard(record["run_dir"])
+                    maybe_fail("run")
+
+                def remove_checkout(*args, **kwargs):
+                    present.discard(record["source_checkout"])
+                    maybe_fail("checkout")
+                    return "REMOVED"
+
+                binding = {"path": entry_path, "sha256": record["root_entry_sha256"],
+                           "verb": "readback", "terminal_dir": record["terminal_dir"],
+                           "terminal_phase": "COMPLETE"}
+                patches = [
+                    mock.patch.object(MOD, "_terminal_lock", return_value=99),
+                    mock.patch.object(MOD, "_terminal_read", side_effect=lambda _p: (record, b"{}")),
+                    mock.patch.object(MOD, "_terminal_advance", side_effect=advance),
+                    mock.patch.object(MOD, "_terminal_publish_complete"),
+                    mock.patch.object(MOD.os, "close"),
+                    mock.patch.object(MOD.os.path, "lexists", side_effect=lexists),
+                    mock.patch.object(MOD.os.path, "isdir", side_effect=isdir),
+                    mock.patch.object(MOD, "_sudoers_remove", side_effect=remove_rule),
+                    mock.patch.object(MOD, "_sudoers_global_check"),
+                    mock.patch.object(MOD, "_stop_watchdog", side_effect=stop_watchdog),
+                    mock.patch.object(MOD, "_assert_no_window_processes"),
+                    mock.patch.object(MOD, "_mounts_for_run", return_value=False),
+                    mock.patch.object(MOD, "_check_run_tree"),
+                    mock.patch.object(MOD, "_read_regular", side_effect=read_regular),
+                    mock.patch.object(MOD.os, "unlink", side_effect=unlink),
+                    mock.patch.object(MOD, "_safe_remove_tree", side_effect=remove_run),
+                    mock.patch.object(MOD, "_validate_checkout_for_cleanup"),
+                    mock.patch.object(MOD, "_remove_checkout", side_effect=remove_checkout),
+                    mock.patch.object(MOD, "_host_snapshots", return_value=record["host_snapshots"]),
+                    mock.patch.object(MOD.os, "readlink", side_effect=lambda path: {
+                        "/proc/self/ns/mnt": "mnt:[10]", "/proc/self/ns/net": "net:[11]"}.get(path)),
+                    mock.patch.object(MOD, "_remove_root_entry", side_effect=lambda p, _sha: present.discard(p)),
+                    mock.patch.object(MOD, "ROOT_ENTRY_BINDING", binding),
+                ]
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    with self.assertRaises(RuntimeError):
+                        MOD._terminal_finish(record["terminal_dir"], "close", True, True)
+                    self.assertEqual(record["phase"], {
+                        "rule": "RULE_INTENT", "watchdog": "WATCHDOG_INTENT",
+                        "bootstrap": "BOOTSTRAP_INTENT", "active": "ACTIVE_INTENT",
+                        "run": "RUN_INTENT", "checkout": "CHECKOUT_INTENT",
+                    }[fail_at])
+                    self.assertEqual(MOD._terminal_finish(record["terminal_dir"]), 0)
+                    self.assertEqual(record["phase"], "COMPLETE")
+                    self.assertNotIn(MOD.BOOTSTRAP, present)
+                    self.assertNotIn(MOD.ACTIVE, present)
+                    self.assertNotIn(record["sudoers_path"], present)
+                    self.assertNotIn(record["run_dir"], present)
+                    self.assertNotIn(record["source_checkout"], present)
+                    self.assertEqual(MOD._terminal_verify_and_mark_readback(record["terminal_dir"], record), 0)
+                    self.assertEqual(record["phase"], "READBACK_DONE")
+                    self.assertNotIn(entry_path, present)
+                    self.assertEqual(MOD._terminal_verify_and_mark_readback(record["terminal_dir"], record), 0)
+                    self.assertEqual(record["phase"], "READBACK_DONE")
+
+    def test_root_installer_same_bytes_install_and_independent_readback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve()
+            dest = root / "lab-g3-archive-a-loader-123456abcdef.py"
+            data = b"trusted synthetic root entry\n"
+            uid, gid = MOD.os.getuid(), MOD.os.getgid()
+            MOD.os.chown(root, uid, gid)
+            spec = {
+                "schema_version": 1,
+                "source_checkout": "/var/tmp/lab-archive-a-src.Synth001",
+                "source_commit": "a" * 40,
+                "source_uid": uid,
+                "source_gid": gid,
+                "entry_sha256": hashlib.sha256(data).hexdigest(),
+                "destination": str(dest),
+                "valid_until_epoch": 9999999999,
+            }
+            with mock.patch.object(INSTALL, "ROOT_UID", MOD.os.getuid()), \
+                    mock.patch.object(INSTALL, "ROOT_GID", MOD.os.getgid()), \
+                    mock.patch.object(INSTALL, "RUN_DIR", str(root)), \
+                    mock.patch.object(INSTALL.pwd, "getpwuid", return_value=SimpleNamespace(pw_gid=gid)), \
+                    mock.patch.object(INSTALL, "ENTRY_PATH", re.compile(
+                        r"^" + re.escape(str(root)) + r"/lab-g3-archive-a-loader-[0-9a-f]{12}\.py$")):
+                checked, same_bytes = INSTALL.install_from_bytes(
+                    json.dumps(spec, sort_keys=True, separators=(",", ":")).encode(),
+                    read_source=lambda *_args: data, now=1)
+                spec_raw = (json.dumps(spec, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                receipt_sha = INSTALL._install(checked, same_bytes, hashlib.sha256(spec_raw).hexdigest())
+                installed, installed_st = INSTALL._read_fixed_root_file(str(dest), 0o500, 4096)
+                receipt_path = pathlib.Path(str(dest)[:-3] + ".install.json")
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(installed, data)
+            self.assertEqual(installed_st.st_nlink, 1)
+            self.assertEqual(stat.S_IMODE(installed_st.st_mode), 0o500)
+            self.assertEqual(receipt["schema_version"], 2)
+            self.assertEqual(receipt["readback"], "PASS")
+            self.assertEqual(receipt["entry_sha256"], hashlib.sha256(data).hexdigest())
+            self.assertEqual(receipt["spec_sha256"], hashlib.sha256(spec_raw).hexdigest())
+            self.assertEqual(receipt_sha, hashlib.sha256(receipt_path.read_bytes()).hexdigest())
+
+    def test_root_installer_resumes_partial_loader_and_receipt_idempotently(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve()
+            dest = root / "lab-g3-archive-a-loader-123456abcdef.py"
+            data = b"synthetic pinned loader bytes\n"
+            uid, gid = MOD.os.getuid(), MOD.os.getgid()
+            MOD.os.chown(root, uid, gid)
+            spec = {
+                "schema_version": 1,
+                "source_checkout": "/var/tmp/lab-archive-a-src.Synth001",
+                "source_commit": "a" * 40,
+                "source_uid": uid, "source_gid": gid,
+                "entry_sha256": hashlib.sha256(data).hexdigest(),
+                "destination": str(dest), "valid_until_epoch": 9999999999,
+            }
+            spec_raw = (json.dumps(spec, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            receipt = {
+                "schema_version": 2,
+                "source_commit": spec["source_commit"],
+                "entry_sha256": spec["entry_sha256"],
+                "destination": spec["destination"],
+                "spec_sha256": hashlib.sha256(spec_raw).hexdigest(),
+                "readback": "PASS",
+            }
+            receipt_raw = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            receipt_path = pathlib.Path(str(dest)[:-3] + ".install.json")
+            dest.write_bytes(data[:9])
+            dest.chmod(0o600)
+            receipt_path.write_bytes(receipt_raw[:17])
+            receipt_path.chmod(0o600)
+            with mock.patch.object(INSTALL, "ROOT_UID", uid), \
+                    mock.patch.object(INSTALL, "ROOT_GID", gid), \
+                    mock.patch.object(INSTALL, "RUN_DIR", str(root)), \
+                    mock.patch.object(INSTALL.pwd, "getpwuid", return_value=SimpleNamespace(pw_gid=gid)), \
+                    mock.patch.object(INSTALL, "ENTRY_PATH", re.compile(
+                        r"^" + re.escape(str(root)) + r"/lab-g3-archive-a-loader-[0-9a-f]{12}\.py$")):
+                checked, same_bytes = INSTALL.install_from_bytes(
+                    spec_raw, read_source=lambda *_args: data, now=1)
+                first_sha = INSTALL._install(checked, same_bytes, hashlib.sha256(spec_raw).hexdigest())
+                second_sha = INSTALL._install(checked, same_bytes, hashlib.sha256(spec_raw).hexdigest())
+                installed, installed_st = INSTALL._read_fixed_root_file(str(dest), 0o500, 4096)
+                saved_receipt, saved_st = INSTALL._read_fixed_root_file(str(receipt_path), 0o600, 4096)
+            self.assertEqual(installed, data)
+            self.assertEqual(saved_receipt, receipt_raw)
+            self.assertEqual(installed_st.st_nlink, 1)
+            self.assertEqual(saved_st.st_nlink, 1)
+            self.assertEqual(first_sha, second_sha)
+
+    def test_root_installer_refuses_nonprefix_partial_artifact_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve()
+            artifact = root / "lab-g3-archive-a-loader-123456abcdef.py"
+            artifact.write_bytes(b"foreign")
+            artifact.chmod(0o600)
+            uid, gid = MOD.os.getuid(), MOD.os.getgid()
+            MOD.os.chown(root, uid, gid)
+            MOD.os.chown(artifact, uid, gid)
+            original = artifact.read_bytes()
+            with mock.patch.object(INSTALL, "ROOT_UID", uid), \
+                    mock.patch.object(INSTALL, "ROOT_GID", gid), \
+                    mock.patch.object(INSTALL, "RUN_DIR", str(root)):
+                with self.assertRaises(INSTALL.Refusal) as caught:
+                    INSTALL._write_install_artifact(artifact.name, b"trusted expected bytes", 0o500, 4096)
+            self.assertEqual(caught.exception.category, "INSTALL_ARTIFACT_CONTENT")
+            self.assertEqual(artifact.read_bytes(), original)
+
+    def test_root_installer_consumes_only_exact_unchanged_spec(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve()
+            spec_path = root / "lab-g3-archive-a-install.json"
+            raw = b"synthetic spec bytes\n"
+            spec_path.write_bytes(raw)
+            spec_path.chmod(0o600)
+            uid, gid = MOD.os.getuid(), MOD.os.getgid()
+            os_chown = INSTALL.os.chown
+            os_chown(root, uid, gid)
+            os_chown(spec_path, uid, gid)
+            with mock.patch.object(INSTALL, "ROOT_UID", uid), \
+                    mock.patch.object(INSTALL, "ROOT_GID", gid), \
+                    mock.patch.object(INSTALL, "RUN_DIR", str(root)), \
+                    mock.patch.object(INSTALL, "SPEC_PATH", str(spec_path)):
+                snapshot = INSTALL.os.stat(spec_path, follow_symlinks=False)
+                INSTALL._consume_spec(raw, snapshot)
+                self.assertFalse(spec_path.exists())
+                spec_path.write_bytes(raw)
+                spec_path.chmod(0o600)
+                os_chown(spec_path, uid, gid)
+                changed = b"changed spec bytes\n"
+                spec_path.write_bytes(changed)
+                spec_path.chmod(0o600)
+                changed_stat = INSTALL.os.stat(spec_path, follow_symlinks=False)
+                with self.assertRaises(INSTALL.Refusal) as caught:
+                    INSTALL._consume_spec(raw, changed_stat)
+            self.assertEqual(caught.exception.category, "SPEC_REMOVE_DRIFT")
+            self.assertEqual(spec_path.read_bytes(), changed)
+
+    def test_root_installer_rejects_wrong_pin_and_source_link_without_installing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve()
+            checkout = root / "lab-archive-a-src.Synth001"
+            (checkout / "ops" / "lab-g3-archive-a").mkdir(parents=True)
+            checkout.chmod(0o700)
+            source = checkout / "ops" / "lab-g3-archive-a" / "root-entry.py"
+            source.write_bytes(b"synthetic entry\n")
+            source.chmod(0o644)
+            uid, gid = MOD.os.getuid(), MOD.os.getgid()
+            MOD.os.chown(checkout, uid, gid)
+            with mock.patch.object(INSTALL, "SOURCE_PATH", re.compile(r"^" + re.escape(str(checkout)) + r"$")), \
+                    mock.patch.object(INSTALL, "SOURCE_REL", ("ops", "lab-g3-archive-a", "root-entry.py")):
+                good = hashlib.sha256(source.read_bytes()).hexdigest()
+                self.assertEqual(INSTALL._read_source_entry(str(checkout), uid, gid, good), b"synthetic entry\n")
+                with self.assertRaises(INSTALL.Refusal) as caught:
+                    INSTALL._read_source_entry(str(checkout), uid, gid, "0" * 64)
+                self.assertEqual(caught.exception.category, "SOURCE_HASH")
+                source.unlink()
+                source.symlink_to(checkout / "missing-target")
+                with self.assertRaises(INSTALL.Refusal):
+                    INSTALL._read_source_entry(str(checkout), uid, gid, good)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), [checkout.name])
+
+    def test_root_installer_readback_mismatch_fails_before_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve()
+            dest = root / "lab-g3-archive-a-loader-123456abcdef.py"
+            data = b"synthetic pinned loader\n"
+            uid, gid = MOD.os.getuid(), MOD.os.getgid()
+            MOD.os.chown(root, uid, gid)
+            spec = {
+                "schema_version": 1,
+                "source_checkout": "/var/tmp/lab-archive-a-src.Synth001",
+                "source_commit": "a" * 40,
+                "source_uid": uid,
+                "source_gid": gid,
+                "entry_sha256": hashlib.sha256(data).hexdigest(),
+                "destination": str(dest),
+                "valid_until_epoch": 9999999999,
+            }
+            with mock.patch.object(INSTALL, "ROOT_UID", uid), \
+                    mock.patch.object(INSTALL, "ROOT_GID", gid), \
+                    mock.patch.object(INSTALL, "RUN_DIR", str(root)), \
+                    mock.patch.object(INSTALL.pwd, "getpwuid", return_value=SimpleNamespace(pw_gid=gid)), \
+                    mock.patch.object(INSTALL, "ENTRY_PATH", re.compile(
+                        r"^" + re.escape(str(root)) + r"/lab-g3-archive-a-loader-[0-9a-f]{12}\.py$")):
+                checked, same_bytes = INSTALL.install_from_bytes(
+                    json.dumps(spec, sort_keys=True, separators=(",", ":")).encode(),
+                    read_source=lambda *_args: data, now=1)
+                readback = INSTALL._read_fixed_root_file
+
+                def altered_readback(path, mode, limit):
+                    blob, st = readback(path, mode, limit)
+                    if path == str(dest):
+                        return b"different bytes", st
+                    return blob, st
+
+                with mock.patch.object(INSTALL, "_read_fixed_root_file", side_effect=altered_readback):
+                    with self.assertRaises(INSTALL.Refusal) as caught:
+                        INSTALL._install(checked, same_bytes)
+            self.assertEqual(caught.exception.category, "INSTALL_READBACK")
+            self.assertTrue(dest.exists())
+            self.assertFalse(root.joinpath("lab-g3-archive-a-loader-123456abcdef.install.json").exists())
+
+    def test_close_reloads_active_under_run_lock_before_mutating(self):
+        observed = {"run_dir": "/run/lab-g3-archive-a-20261124T000000Z-abcdef123456"}
+        changed = {"run_dir": "/run/lab-g3-archive-a-20261124T000001Z-123456abcdef"}
+        with mock.patch.object(MOD, "_check_root"), \
+                mock.patch.object(MOD, "_active_read", return_value=observed), \
+                mock.patch.object(MOD, "_locked", return_value=91) as locked, \
+                mock.patch.object(MOD, "_active_meta_digests", return_value=(changed, b"", "a" * 64, "b" * 64)), \
+                mock.patch.object(MOD, "_close_locked") as close_locked, \
+                mock.patch.object(MOD.os, "close") as close_fd:
+            with self.assertRaises(MOD.Refusal) as caught:
+                MOD._close()
+        self.assertEqual(caught.exception.category, "ACTIVE_CHANGED")
+        locked.assert_called_once_with(observed["run_dir"])
+        close_locked.assert_not_called()
+        close_fd.assert_called_once_with(91)
+
+    def test_expiry_reloads_active_under_run_lock_before_revoking(self):
+        observed = {"run_dir": "/run/lab-g3-archive-a-20261124T000000Z-abcdef123456"}
+        changed = {"run_dir": "/run/lab-g3-archive-a-20261124T000001Z-123456abcdef"}
+        with mock.patch.object(MOD, "_check_root"), \
+                mock.patch.object(MOD, "_active_read", return_value=observed), \
+                mock.patch.object(MOD, "_locked", return_value=92) as locked, \
+                mock.patch.object(MOD, "_active_meta_digests", return_value=(changed, b"", "a" * 64, "b" * 64)), \
+                mock.patch.object(MOD, "_sudoers_remove") as remove_rule, \
+                mock.patch.object(MOD.os, "close") as close_fd:
+            with self.assertRaises(MOD.Refusal) as caught:
+                MOD._expire_window()
+        self.assertEqual(caught.exception.category, "ACTIVE_CHANGED")
+        locked.assert_called_once_with(observed["run_dir"])
+        remove_rule.assert_not_called()
+        close_fd.assert_called_once_with(92)
+
+    def test_root_entry_rejects_extra_arguments(self):
+        with mock.patch.object(ROOT, "run") as run:
+            self.assertEqual(ROOT.main(["abort", "extra"]), 2)
+            run.assert_not_called()
+
+    def test_root_loader_hashes_and_returns_exact_fd_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve() / "checkout"
+            (root / "ops" / "lab-g3-archive-a").mkdir(parents=True)
+            source = root / "ops" / "lab-g3-archive-a" / "stage-window.py"
+            original = b"VALUE='verified bytes'\n"
+            source.write_bytes(original)
+            source.chmod(0o600)
+            root.chmod(0o700)
+            uid = MOD.os.getuid()
+            gid = MOD.pwd.getpwuid(uid).pw_gid
+            MOD.os.chown(root, uid, gid)
+            with mock.patch.object(ROOT, "SOURCE_PATH", re.compile(r"^" + re.escape(str(root)) + r"$")):
+                path, loaded = ROOT._read_controller(str(root), uid, hashlib.sha256(original).hexdigest())
+                self.assertEqual(path, str(source))
+                self.assertEqual(loaded, original)
+                source.write_bytes(b"VALUE='changed after verified read'\n")
+                namespace = {"__name__": "synthetic", "__file__": path}
+                exec(compile(loaded, path, "exec", dont_inherit=True), namespace, namespace)
+                self.assertEqual(namespace["VALUE"], "verified bytes")
+                self.assertEqual(ROOT.pwd.getpwuid(uid).pw_gid, gid)
+
+    def test_root_loader_rejects_controller_symlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve() / "checkout"
+            source_dir = root / "ops" / "lab-g3-archive-a"
+            source_dir.mkdir(parents=True)
+            target = pathlib.Path(temp) / "outside.py"
+            target.write_text("pass\n", encoding="utf-8")
+            (source_dir / "stage-window.py").symlink_to(target)
+            root.chmod(0o700)
+            uid = MOD.os.getuid()
+            MOD.os.chown(root, uid, MOD.pwd.getpwuid(uid).pw_gid)
+            with mock.patch.object(ROOT, "SOURCE_PATH", re.compile(r"^" + re.escape(str(root)) + r"$")):
+                with self.assertRaises(ROOT.Refusal) as caught:
+                    ROOT._read_controller(str(root), uid, hashlib.sha256(b"pass\n").hexdigest())
+            self.assertEqual(caught.exception.category, "SOURCE_FILE")
+
     @staticmethod
     def network_rows():
         return {
@@ -192,6 +832,266 @@ class StageWindowTests(unittest.TestCase):
             with mock.patch.object(MOD, "_readback", return_value=23) as readback:
                 self.assertEqual(MOD.main(["readback"]), 23)
             readback.assert_called_once_with()
+
+    def test_abort_markers_block_unentered_seats(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_base = pathlib.Path(temp).resolve()
+            run_name = "lab-g3-archive-a-20261124T000000Z-abcdef123456"
+            run_dir = str(run_base / run_name)
+            pathlib.Path(run_dir).mkdir(mode=0o700)
+            with mock.patch.object(MOD, "RUN_BASE", str(run_base)):
+                paths = MOD._abort_record_paths(run_dir)
+                self.assertFalse(MOD._is_aborting(run_dir))
+                pathlib.Path(paths["intent"]).write_text("synthetic\n", encoding="ascii")
+                self.assertTrue(MOD._is_aborting(run_dir))
+                pathlib.Path(paths["intent"]).unlink()
+                pathlib.Path(paths["receipt"]).write_text("synthetic\n", encoding="ascii")
+                self.assertTrue(MOD._is_aborting(run_dir))
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._reject_aborting(run_dir)
+                self.assertEqual(caught.exception.category, "WINDOW_ABORTING")
+
+    def test_entry_checks_aborting_under_shared_lock_before_launch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = pathlib.Path(temp).resolve() / "lab-g3-archive-a-20261124T000000Z-abcdef123456"
+            run_dir.mkdir(mode=0o700)
+            script = run_dir / "stage-window.py"
+            script.write_text("# synthetic\n", encoding="ascii")
+            events = []
+            active = {"run_dir": str(run_dir), "run_name": run_dir.name}
+            meta = {"deadline": 9000}
+
+            def locked(_path):
+                events.append("lock")
+                return MOD.os.open(MOD.os.devnull, MOD.os.O_RDONLY)
+
+            def aborting(_path):
+                events.append("aborting-check")
+                raise MOD.Refusal("WINDOW_ABORTING")
+
+            with mock.patch.object(MOD, "__file__", str(script)), \
+                    mock.patch.object(MOD, "RUN_BASE", str(run_dir.parent)), \
+                    mock.patch.object(MOD, "_check_root"), \
+                    mock.patch.object(MOD, "_locked", side_effect=locked), \
+                    mock.patch.object(MOD, "_active_read", return_value=active), \
+                    mock.patch.object(MOD, "_load_meta", return_value=meta), \
+                    mock.patch.object(MOD, "_check_active_meta"), \
+                    mock.patch.object(MOD, "_reject_aborting", side_effect=aborting), \
+                    mock.patch.object(MOD, "_write_new") as write_new, \
+                    mock.patch.object(MOD.subprocess, "Popen") as popen:
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._entry("field")
+            self.assertEqual(caught.exception.category, "WINDOW_ABORTING")
+            self.assertEqual(events, ["lock", "aborting-check"])
+            write_new.assert_not_called()
+            popen.assert_not_called()
+
+    def test_inner_refuses_aborting_before_enter_marker_or_helper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = pathlib.Path(temp).resolve() / "lab-g3-archive-a-20261124T000000Z-abcdef123456"
+            run_dir.mkdir(mode=0o700)
+            script = run_dir / "stage-window.py"
+            script.write_text("# synthetic\n", encoding="ascii")
+            active = {"run_dir": str(run_dir), "run_name": run_dir.name}
+            meta = {"deadline": 9999999999}
+            fd = MOD.os.open(MOD.os.devnull, MOD.os.O_RDONLY)
+            with mock.patch.object(MOD, "__file__", str(script)), \
+                    mock.patch.object(MOD, "RUN_BASE", str(run_dir.parent)), \
+                    mock.patch.object(MOD, "_check_root"), \
+                    mock.patch.object(MOD, "_locked", return_value=fd), \
+                    mock.patch.object(MOD, "_active_read", return_value=active), \
+                    mock.patch.object(MOD, "_load_meta", return_value=meta), \
+                    mock.patch.object(MOD, "_check_active_meta"), \
+                    mock.patch.object(MOD, "_reject_aborting", side_effect=MOD.Refusal("WINDOW_ABORTING")), \
+                    mock.patch.object(MOD, "_write_new") as write_new, \
+                    mock.patch.object(MOD, "_check_network_isolation") as network:
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._inner("review")
+            self.assertEqual(caught.exception.category, "WINDOW_ABORTING")
+            write_new.assert_not_called()
+            network.assert_not_called()
+
+    def test_entry_launch_record_binds_unshare_pid_while_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = pathlib.Path(temp).resolve() / "lab-g3-archive-a-20261124T000000Z-abcdef123456"
+            run_dir.mkdir(mode=0o700)
+            script = run_dir / "stage-window.py"
+            script.write_text("# synthetic\n", encoding="ascii")
+            active = {"run_dir": str(run_dir), "run_name": run_dir.name}
+            meta = {"deadline": int(MOD.time.time()) + 60}
+            events = []
+            lock_fds = iter([101, 102])
+            writes = []
+
+            class Child:
+                pid = 5678
+                returncode = 0
+
+                @staticmethod
+                def communicate(timeout=None):
+                    return valid_entry_output().encode("utf-8"), b""
+
+            def locked(_path):
+                events.append("lock")
+                return next(lock_fds)
+
+            def write_new(path, content, mode=0o600):
+                events.append("write")
+                writes.append((path, content))
+
+            def popen(*args, **kwargs):
+                events.append("popen")
+                self.assertEqual(events, ["lock", "write", "popen"])
+                return Child()
+
+            real_close = MOD.os.close
+            def close_fd(fd):
+                events.append("unlock")
+                if fd not in (101, 102):
+                    real_close(fd)
+
+            with mock.patch.object(MOD, "__file__", str(script)), \
+                    mock.patch.object(MOD, "RUN_BASE", str(run_dir.parent)), \
+                    mock.patch.object(MOD, "_check_root"), \
+                    mock.patch.object(MOD, "_locked", side_effect=locked), \
+                    mock.patch.object(MOD, "_active_read", return_value=active), \
+                    mock.patch.object(MOD, "_load_meta", return_value=meta), \
+                    mock.patch.object(MOD, "_check_active_meta"), \
+                    mock.patch.object(MOD, "_reject_aborting"), \
+                    mock.patch.object(MOD, "_process_starttime", return_value=4321), \
+                    mock.patch.object(MOD, "_validate_entry_output"), \
+                    mock.patch.object(MOD, "_write_new", side_effect=write_new), \
+                    mock.patch.object(MOD.subprocess, "Popen", side_effect=popen), \
+                    mock.patch.object(MOD.os, "close", side_effect=close_fd):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(MOD._entry("field"), 0)
+            entry_path = str(run_dir / "entry.field.json")
+            launch_raw = next(content for path, content in writes if path == entry_path)
+            launch = json.loads(launch_raw)
+            self.assertEqual(launch["entry_pid"], 5678)
+            self.assertEqual(launch["entry_starttime"], 4321)
+            self.assertEqual(events.count("unlock"), 2)
+            self.assertLess(events.index("popen"), events.index("unlock"))
+
+    def test_abort_requires_exact_live_sudoers_rule_before_intent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_base = pathlib.Path(temp).resolve()
+            run_name = "lab-g3-archive-a-20261124T000000Z-abcdef123456"
+            run_dir = run_base / run_name
+            run_dir.mkdir(mode=0o700)
+            lock_path = run_dir / "control.lock"
+            lock_path.write_bytes(b"")
+            lock_path.chmod(0o600)
+            active_path = run_base / "active.json"
+            active = {"run_dir": str(run_dir), "run_name": run_name,
+                      "terminal_dir": "/run/lab-g3-archive-a-terminal/" + run_name + ".journal",
+                      "sudoers_path": str(run_base / "sudoers" / run_name),
+                      "sudoers_sha256": "c" * 64}
+            lockfd = MOD.os.open(str(lock_path), MOD.os.O_RDWR)
+            with mock.patch.object(MOD, "RUN_BASE", str(run_base)), \
+                    mock.patch.object(MOD, "ACTIVE", str(active_path)), \
+                    mock.patch.object(MOD, "SUDOERS_DIR", str(run_base / "sudoers")), \
+                    mock.patch.object(MOD, "_check_root"), \
+                    mock.patch.object(MOD, "_active_read", return_value=active), \
+                    mock.patch.object(MOD, "_locked", return_value=lockfd), \
+                    mock.patch.object(MOD, "_active_meta_digests", return_value=(active, b"{}", "a" * 64, "b" * 64)), \
+                    mock.patch.object(MOD, "_load_meta", return_value={"deadline": 9000}), \
+                    mock.patch.object(MOD, "_check_active_meta"), \
+                    mock.patch.object(MOD, "_terminal_read", return_value=({"phase": "RUNNING"}, b"{}")), \
+                    mock.patch.object(MOD, "_sudoers_entry_present", return_value=False), \
+                    mock.patch.object(MOD, "_write_new") as write_new, \
+                    mock.patch.object(MOD, "_sudoers_remove") as remove:
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._abort()
+                self.assertEqual(caught.exception.category, "ABORT_RULE_ABSENT")
+                write_new.assert_not_called()
+                remove.assert_not_called()
+                self.assertTrue(lockfd >= 0)
+
+    def test_abort_revoked_receipt_binds_the_same_intent_but_changes_state(self):
+        active = {"run_name": "lab-g3-archive-a-20261124T000000Z-abcdef123456",
+                  "run_dir": "/run/lab-g3-archive-a-20261124T000000Z-abcdef123456",
+                  "sudoers_path": "/etc/sudoers.d/lab-g3-archive-a-20261124T000000Z-abcdef123456",
+                  "sudoers_sha256": "a" * 64}
+        meta = {"source_checkout": "/var/tmp/lab-archive-a-src.Synth001",
+                "source_commit": "b" * 40, "operator_uid": 1001, "deadline": 9000,
+                "stage_script_sha256": "c" * 64, "root_entry_path": "/run/lab-g3-archive-a-loader-123456abcdef.py",
+                "root_entry_sha256": "d" * 64}
+        intent = MOD._abort_bindings(active, meta, "e" * 64, "f" * 64)
+        intent.update({"state": "ABORTING", "requested_utc": "2026-11-24T00:00:00Z"})
+        revoked = dict(intent)
+        revoked.update({"state": "REVOKED", "rule_absent": True, "visudo": "PASS",
+                        "verified_utc": "2026-11-24T00:00:01Z"})
+        raw = (json.dumps(revoked, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        with mock.patch.object(MOD, "_read_regular", return_value=(raw, None)):
+            accepted, accepted_raw = MOD._read_abort_revoked(active["run_dir"], intent)
+        self.assertEqual(accepted["state"], "REVOKED")
+        self.assertEqual(accepted_raw, raw)
+        revoked["root_entry_sha256"] = "0" * 64
+        bad = (json.dumps(revoked, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        with mock.patch.object(MOD, "_read_regular", return_value=(bad, None)):
+            with self.assertRaises(MOD.Refusal) as caught:
+                MOD._read_abort_revoked(active["run_dir"], intent)
+        self.assertEqual(caught.exception.category, "ABORT_BINDING_MISMATCH")
+
+    def test_watchdog_stop_uses_bound_pidfd_and_refuses_reused_pid(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            watchdog_path = pathlib.Path(run_dir) / "watchdog.pid"
+            watchdog_path.write_text("synthetic\n", encoding="ascii")
+            watchdog_path.chmod(0o600)
+            record = {"pid": 987654, "starttime": 321,
+                      "cwd": "/var/tmp/lab-archive-a-src.Synth001",
+                      "argv_sha256": hashlib.sha256("\0".join(
+                          MOD._watchdog_exec_argv(run_dir)).encode()).hexdigest()}
+            poller = mock.MagicMock()
+            poller.poll.side_effect = [[], [(7, 1)]]
+            real_close = MOD.os.close
+            with mock.patch.object(MOD, "_require_pidfd_support"), \
+                    mock.patch.object(MOD, "_watchdog_record", return_value=record), \
+                    mock.patch.object(MOD, "_process_starttime", return_value=321), \
+                    mock.patch.object(MOD, "_proc_command_and_cwd", return_value=(
+                        [b"/usr/bin/python3", b"-IB", (run_dir + "/stage-window.py").encode(), b"watchdog"],
+                        record["cwd"])), \
+                    mock.patch.object(MOD, "_watchdog_identity_matches", return_value=True), \
+                    mock.patch.object(MOD.os, "pidfd_open", return_value=77, create=True), \
+                    mock.patch.object(MOD.signal, "pidfd_send_signal", create=True) as send, \
+                    mock.patch.object(MOD.select, "poll", return_value=poller), \
+                    mock.patch.object(MOD.os, "kill") as numeric_kill, \
+                    mock.patch.object(MOD.os, "close", side_effect=lambda fd: None if fd == 77 else real_close(fd)):
+                self.assertEqual(MOD._stop_watchdog(run_dir), "STOPPED")
+                send.assert_called_once_with(77, MOD.signal.SIGTERM)
+                numeric_kill.assert_not_called()
+
+            with mock.patch.object(MOD, "_require_pidfd_support"), \
+                    mock.patch.object(MOD, "_watchdog_record", return_value=record), \
+                    mock.patch.object(MOD, "_process_starttime", return_value=999), \
+                    mock.patch.object(MOD, "_proc_command_and_cwd", return_value=([], "wrong")), \
+                    mock.patch.object(MOD, "_watchdog_identity_matches", return_value=False), \
+                    mock.patch.object(MOD.os, "pidfd_open", return_value=77, create=True), \
+                    mock.patch.object(MOD.signal, "pidfd_send_signal", create=True) as send, \
+                    mock.patch.object(MOD.os, "close", side_effect=lambda fd: None if fd == 77 else real_close(fd)):
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._stop_watchdog(run_dir)
+                self.assertEqual(caught.exception.category, "WATCHDOG_IDENTITY_MISMATCH")
+                send.assert_not_called()
+
+    def test_watchdog_pidfd_uncertainty_preserves_state_without_numeric_kill(self):
+        original = MOD.WATCHDOG_START_UNCERTAIN
+        MOD.WATCHDOG_START_UNCERTAIN = False
+        with mock.patch.object(MOD, "_require_pidfd_support"), \
+                mock.patch.object(MOD.os, "pidfd_open", side_effect=[77, PermissionError("synthetic")], create=True), \
+                mock.patch.object(MOD.os, "fork", return_value=56789), \
+                mock.patch.object(MOD.os, "close"), \
+                mock.patch.object(MOD.os, "kill", create=True) as numeric_kill:
+            try:
+                with self.assertRaises(MOD.Refusal) as caught:
+                    MOD._start_watchdog("/run/lab-g3-archive-a-20261124T000000Z-abcdef123456", 9999999999)
+                self.assertEqual(caught.exception.category, "PIDFD_UNAVAILABLE")
+                self.assertTrue(MOD.WATCHDOG_START_UNCERTAIN)
+                numeric_kill.assert_not_called()
+            finally:
+                MOD.WATCHDOG_START_UNCERTAIN = original
+
 
     def test_entry_only_relays_fixed_inner_failure_categories(self):
         self.assertEqual(MOD._fixed_failure_category(b"STATUS=FAIL CATEGORY=ANCHOR_CHANGED\n"),
